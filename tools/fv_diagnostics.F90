@@ -141,7 +141,7 @@ module fv_diagnostics_mod
  use mpp_mod,            only: mpp_error, FATAL, stdlog, mpp_pe, mpp_root_pe, mpp_sum, mpp_max, NOTE
  use sat_vapor_pres_mod, only: compute_qs, lookup_es
 
- use fv_arrays_mod, only: max_step 
+ use fv_arrays_mod, only: max_step
 #ifndef GFS_PHYS
  use gfdl_cloud_microphys_mod, only: wqs1, qsmith_init
 #endif
@@ -3126,25 +3126,25 @@ contains
          do i=is,ie
             wz(i,j,km+1) = idiag%zsurf(i,j)
          enddo
-      if (hydrostatic ) then
-         do k=km,1,-1
-            do i=is,ie
+         if (hydrostatic ) then
+            do k=km,1,-1
+              do i=is,ie
 #ifdef MULTI_GASES
-               wz(i,j,k) = wz(i,j,k+1) + gg*pt(i,j,k)*virq(q(i,j,k,1:num_gas))  &
+                wz(i,j,k) = wz(i,j,k+1) + gg*pt(i,j,k)*virq(q(i,j,k,1:num_gas))  &
                           *(peln(i,k+1,j)-peln(i,k,j))
 #else
-               wz(i,j,k) = wz(i,j,k+1) + gg*pt(i,j,k)*(1.+zvir*q(i,j,k,sphum))  &
+                wz(i,j,k) = wz(i,j,k+1) + gg*pt(i,j,k)*(1.+zvir*q(i,j,k,sphum))  &
                           *(peln(i,k+1,j)-peln(i,k,j))
 #endif
+              enddo
             enddo
-         enddo
-      else
-         do k=km,1,-1
-            do i=is,ie
-               wz(i,j,k) = wz(i,j,k+1)  - delz(i,j,k)
+         else
+            do k=km,1,-1
+              do i=is,ie
+                wz(i,j,k) = wz(i,j,k+1)  - delz(i,j,k)
+              enddo
             enddo
-         enddo
-      endif
+         endif
       enddo
 
  end subroutine get_height_field
@@ -3194,9 +3194,13 @@ contains
             do j=js,je
                do i=is,ie
                   if( q(i,j,k)<q_low .or. q(i,j,k)>q_hi ) then
-                      write(*,*) 'Warn_K=',k,'(i,j)=',i,j, pos(i,j,1)*rad2deg, pos(i,j,2)*rad2deg, q(i,j,k)
-                      if ( k/= 1 ) write(*,*) k-1, q(i,j,k-1)
-                      if ( k/=km ) write(*,*) k+1, q(i,j,k+1)
+                      ! added output of vertical level k (Ramstrom)
+                      write(*,*) 'Warn_K=',k,'(i,j,k)=',i,j, k, pos(i,j,1)*rad2deg, pos(i,j,2)*rad2deg, q(i,j,k)
+                      if ( k/= 1 ) write(*,*) '(i,j,k-1)', i, j, k-1, q(i,j,k-1)
+                      if ( k/=km ) write(*,*) '(i,j,k+1)', i, j, k+1, q(i,j,k+1)
+                      !write(*,*) 'Warn_K=',k,'(i,j)=',i,j, pos(i,j,1)*rad2deg, pos(i,j,2)*rad2deg, q(i,j,k)
+                      !if ( k/= 1 ) write(*,*) k-1, q(i,j,k-1)
+                      !if ( k/=km ) write(*,*) k+1, q(i,j,k+1)
                   endif
                enddo
             enddo

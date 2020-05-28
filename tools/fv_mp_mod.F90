@@ -1,27 +1,27 @@
 !***********************************************************************
-!*                   GNU Lesser General Public License                 
+!*                   GNU Lesser General Public License
 !*
 !* This file is part of the FV3 dynamical core.
 !*
-!* The FV3 dynamical core is free software: you can redistribute it 
+!* The FV3 dynamical core is free software: you can redistribute it
 !* and/or modify it under the terms of the
 !* GNU Lesser General Public License as published by the
-!* Free Software Foundation, either version 3 of the License, or 
+!* Free Software Foundation, either version 3 of the License, or
 !* (at your option) any later version.
 !*
-!* The FV3 dynamical core is distributed in the hope that it will be 
-!* useful, but WITHOUT ANYWARRANTY; without even the implied warranty 
-!* of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  
+!* The FV3 dynamical core is distributed in the hope that it will be
+!* useful, but WITHOUT ANYWARRANTY; without even the implied warranty
+!* of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 !* See the GNU General Public License for more details.
 !*
 !* You should have received a copy of the GNU Lesser General Public
-!* License along with the FV3 dynamical core.  
+!* License along with the FV3 dynamical core.
 !* If not, see <http://www.gnu.org/licenses/>.
 !***********************************************************************
 
 !>@brief The module 'fv_mp_mod' is a single program multiple data (SPMD)
 !! parallel decompostion/communication module
-      module fv_mp_mod
+module fv_mp_mod
 
 ! <table>
 ! <tr>
@@ -83,7 +83,7 @@
       use mpp_domains_mod, only : mpp_get_compute_domain, mpp_get_data_domain
       use mpp_domains_mod, only : mpp_global_field, mpp_global_sum, mpp_global_max, mpp_global_min
       use mpp_domains_mod, only : mpp_domains_init, mpp_domains_exit, mpp_broadcast_domain
-      use mpp_domains_mod, only : mpp_check_field, mpp_define_layout 
+      use mpp_domains_mod, only : mpp_check_field, mpp_define_layout
       use mpp_domains_mod, only : mpp_get_neighbor_pe, mpp_define_mosaic, mpp_define_io_domain
       use mpp_domains_mod, only : NORTH, NORTH_EAST, EAST, SOUTH_EAST
       use mpp_domains_mod, only : SOUTH, SOUTH_WEST, WEST, NORTH_WEST
@@ -125,13 +125,14 @@
 
       type(nest_domain_type), allocatable, dimension(:)       :: nest_domain
       integer :: this_pe_grid = 0
-      integer, EXTERNAL :: omp_get_thread_num, omp_get_num_threads      
+      integer, EXTERNAL :: omp_get_thread_num, omp_get_num_threads
 
       integer :: npes_this_grid
 
       !! CLEANUP: these are currently here for convenience
-      !! Right now calling switch_current_atm sets these to the value on the "current" grid
-      !!  (as well as changing the "current" domain) 
+      !! Right now calling switch_current_atm sets these to
+      !! the value on the "current" grid
+      !!  (as well as changing the "current" domain)
       integer :: is, ie, js, je
       integer :: isd, ied, jsd, jed
       integer :: isc, iec, jsc, jec
@@ -628,8 +629,12 @@ contains
                if( nregions .NE. 1 ) then
                   call mpp_error(FATAL, 'domain_decomp: nregions should be 1 for nested region, contact developer')
                endif
-               tile_id(1) = 7   ! currently we assuming the nested tile is nested in one face of cubic sphere grid.
-                                ! we need a more general way to deal with nested grid tile id.
+               !tile_id(1) = 7   ! currently we assuming the nested tile is nested in one face of cubic sphere grid.
+               !                 ! we need a more general way to deal with nested grid tile id.
+               ! RAMSTROM Allow multiple nests by pulling from the Atm structure
+               !tile_id(1) = Atm%neststruct%nest_domain%tile_fine  -- this is a private structure, so compile fails
+               tile_id(1) = Atm%grid_number + 6 - 1
+               print '("[INFO] WDR fv_mp_mod.F90:domain_decomp  setting nested tile_id(1) to  ",I0," gid: ",I0)', tile_id(1), gid
             else
                do n = 1, nregions
                   tile_id(n) = n

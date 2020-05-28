@@ -207,12 +207,11 @@ module external_ic_mod
 
 contains
 
-   subroutine get_external_ic( Atm, fv_domain, cold_start, dt_atmos )
+   subroutine get_external_ic( Atm, fv_domain, cold_start )
 
       type(fv_atmos_type), intent(inout), target :: Atm(:)
       type(domain2d),      intent(inout) :: fv_domain
       logical, intent(IN) :: cold_start
-      real, intent(IN) :: dt_atmos
       real:: alpha = 0.
       real rdg
       integer i,j,k,nq
@@ -289,7 +288,7 @@ contains
 #endif
       elseif ( Atm(1)%flagstruct%nggps_ic ) then
                              call timing_on('NGGPS_IC')
-           call get_nggps_ic( Atm, fv_domain, dt_atmos )
+           call get_nggps_ic( Atm, fv_domain )
                              call timing_off('NGGPS_IC')
       elseif ( Atm(1)%flagstruct%ecmwf_ic ) then
            if( is_master() ) write(*,*) 'Calling get_ecmwf_ic'
@@ -408,11 +407,11 @@ contains
     allocate( tile_id(ntileMe) )
     tile_id = mpp_get_tile_id( fv_domain )
     do n=1,ntileMe
-
+       print '("[INFO] WDR external_ic.F90 get_tile_string tile_id(n)= ",I0, I0)', n, tile_id(n)
        call get_tile_string(fname, 'INPUT/fv_core.res'//trim(gn)//'.tile', tile_id(n), '.nc' )
        if (mpp_pe() == mpp_root_pe()) print*, 'external_ic: looking for ', fname
 
-       
+
        if( file_exist(fname) ) then
           call read_data(fname, 'phis', Atm(n)%phis(is:ie,js:je),      &
                          domain=fv_domain, tile_count=n)
@@ -443,7 +442,7 @@ contains
 !>@brief The subroutine 'get_nggps_ic' reads in data after it has been preprocessed with 
 !!    NCEP/EMC orography maker and 'global_chgres', and has been horiztontally
 !! interpolated to the current cubed-sphere grid
-  subroutine get_nggps_ic (Atm, fv_domain, dt_atmos )
+  subroutine get_nggps_ic (Atm, fv_domain)
 
 !>variables read in from 'gfs_ctrl.nc'
 !>       VCOORD  -  level information
@@ -472,7 +471,6 @@ contains
 
       type(fv_atmos_type), intent(inout) :: Atm(:)
       type(domain2d),      intent(inout) :: fv_domain
-      real, intent(in) :: dt_atmos
 ! local:
       real, dimension(:), allocatable:: ak, bk
       real, dimension(:,:), allocatable:: wk2, ps, oro_g
@@ -681,6 +679,17 @@ contains
         endif
       endif
 
+      ! Description of array indices (Ramstrom):
+      ! Data domain is larger than the compute domain by the number of halo points (likely 3)
+      ! is - compute domain start, i direction
+      ! js - compute domain start, j direction
+      ! ie - compute domain end, i direction
+      ! je - compute domain end, j direction
+      ! isd - data domain start (is-3), i direction
+      ! jsd - data domain start (js-3), j direction
+      ! ied - data domain end (ie+3), i direction
+      ! jed - data domain end (je+3), j direction
+
       is  = Atm(1)%bd%is
       ie  = Atm(1)%bd%ie
       js  = Atm(1)%bd%js
@@ -842,6 +851,14 @@ contains
           Atm(n)%ak(1:npz+1) = ak(itoa:levp+1)
           Atm(n)%bk(1:npz+1) = bk(itoa:levp+1)
           call set_external_eta (Atm(n)%ak, Atm(n)%bk, Atm(n)%ptop, Atm(n)%ks)
+        else
+          if ( npz <= 64 ) then
+             Atm(n)%ak(:) = ak_sj(:)
+             Atm(n)%bk(:) = bk_sj(:)
+             Atm(n)%ptop = Atm(n)%ak(1)
+          else
+             call set_eta(npz, ks, Atm(n)%ptop, Atm(n)%ak, Atm(n)%bk)
+          endif
         endif
         ! call vertical remapping algorithms
         if(is_master())  write(*,*) 'GFS ak =', ak,' FV3 ak=',Atm(n)%ak
@@ -855,7 +872,7 @@ contains
 
         if (n==1.and.Atm(1)%flagstruct%regional) then     !<-- Select the parent regional domain.
 
-          call start_regional_cold_start(Atm(1), dt_atmos, ak, bk, levp, &
+          call start_regional_cold_start(Atm(1), ak, bk, levp, &
                                          is, ie, js, je, &
                                          isd, ied, jsd, jed )
         endif
@@ -1575,13 +1592,13 @@ contains
 
       
 ! Set up model's ak and bk
-!     if ( npz <= 64 ) then
-!        Atm(1)%ak(:) = ak_sj(:)
-!        Atm(1)%bk(:) = bk_sj(:)
-!        Atm(1)%ptop = Atm(1)%ak(1)
-!     else
-!        call set_eta(npz, ks, Atm(1)%ptop, Atm(1)%ak, Atm(1)%bk)
-!     endif
+      if ( npz <= 64 ) then
+         Atm(1)%ak(:) = ak_sj(:)
+         Atm(1)%bk(:) = bk_sj(:)
+         Atm(1)%ptop = Atm(1)%ak(1)
+      else
+         call set_eta(npz, ks, Atm(1)%ptop, Atm(1)%ak, Atm(1)%bk)
+      endif
 
 !! Read in model terrain from oro_data.tile?.nc
       if (filtered_terrain) then
@@ -2655,14 +2672,14 @@ contains
   k2 = max(10, km/2)
 
   if (mpp_pe()==1) then
-    print *, 'sphum    = ', sphum
-    print *, 'clwmr    = ', liq_wat
+    print *, 'sphum = ', sphum
+    print *, 'clwmr = ', liq_wat
 #ifdef MULTI_GASES
-    print *, 'spfo3    = ', spfo3
-    print *, ' spfo    = ', spfo
-    print *, 'spfo2    = ', spfo2
+    print *, 'spfo3 = ', spfo3
+    print *, ' spfo = ', spfo
+    print *, 'spfo2 = ', spfo2
 #else
-    print *, ' o3mr    = ', o3mr
+    print *, ' o3mr = ', o3mr
 #endif
     print *, 'liq_aero = ', liq_aero
     print *, 'ice_aero = ', ice_aero
