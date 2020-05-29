@@ -331,6 +331,9 @@ module fv_control_mod
   logical, pointer :: nested, twowaynest
   logical, pointer :: regional
   integer, pointer :: bc_update_interval
+  integer, pointer :: nrows_blend
+  logical, pointer :: regional_bcs_from_gsi
+  logical, pointer :: write_restart_with_bcs
   integer, pointer :: parent_tile, refinement, nestbctype, nestupdate, nsponge, ioffset, joffset
   real, pointer :: s_weight, update_blend
 
@@ -688,7 +691,8 @@ contains
         refinement, nestbctype, nestupdate, nsponge, s_weight, &
         ioffset, joffset, check_negative, nudge_ic, halo_update_type, &
         gfs_phil, agrid_vel_rst, do_uni_zfull, adj_mass_vmr, &
-        fac_n_spl, fhouri, regional, bc_update_interval
+        fac_n_spl, fhouri, regional, bc_update_interval, &
+        regional_bcs_from_gsi, write_restart_with_bcs, nrows_blend
     namelist /test_case_nml/test_case, bubble_do, alpha, &
         nsolitons, soliton_Umax, soliton_size
 #ifdef MULTI_GASES
@@ -779,8 +783,8 @@ contains
        if( is_master() ) print *,' enter multi_gases: ncnst = ',ncnst
        allocate (rilist(0:ncnst))
        allocate (cpilist(0:ncnst))
-       allocate (rilist(0:ncnst))
-       allocate (cpilist(0:ncnst))
+       ! allocate (rilist(0:ncnst))
+       ! allocate (cpilist(0:ncnst))
        rilist     = 0.0
        cpilist    = 0.0
        rilist(0)  = rdgas
@@ -1303,6 +1307,9 @@ contains
     target_lon                    => Atm%flagstruct%target_lon
     regional                      => Atm%flagstruct%regional
     bc_update_interval            => Atm%flagstruct%bc_update_interval
+    nrows_blend                   => Atm%flagstruct%nrows_blend
+    regional_bcs_from_gsi         => Atm%flagstruct%regional_bcs_from_gsi
+    write_restart_with_bcs        => Atm%flagstruct%write_restart_with_bcs
     reset_eta                     => Atm%flagstruct%reset_eta
     p_fac                         => Atm%flagstruct%p_fac
     a_imp                         => Atm%flagstruct%a_imp
