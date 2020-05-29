@@ -1,27 +1,41 @@
 
 !***********************************************************************
-!*                   GNU Lesser General Public License                 
+!*                   GNU Lesser General Public License
 !*
 !* This file is part of the FV3 dynamical core.
 !*
-!* The FV3 dynamical core is free software: you can redistribute it 
+!* The FV3 dynamical core is free software: you can redistribute it
 !* and/or modify it under the terms of the
 !* GNU Lesser General Public License as published by the
-!* Free Software Foundation, either version 3 of the License, or 
+!* Free Software Foundation, either version 3 of the License, or
 !* (at your option) any later version.
 !*
-!* The FV3 dynamical core is distributed in the hope that it will be 
-!* useful, but WITHOUT ANYWARRANTY; without even the implied warranty 
-!* of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  
+!* The FV3 dynamical core is distributed in the hope that it will be
+!* useful, but WITHOUT ANYWARRANTY; without even the implied warranty
+!* of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 !* See the GNU General Public License for more details.
 !*
 !* You should have received a copy of the GNU Lesser General Public
-!* License along with the FV3 dynamical core.  
+!* License along with the FV3 dynamical core.
 !* If not, see <http://www.gnu.org/licenses/>.
 !***********************************************************************
 
 !>@brief The module 'FV3_control' is for initialization and termination
 !! of the model, and controls namelist parameters in FV3.
+!
+! Modifications:
+! 05/07/2020 -- run_setup subroutine now allows multiple nests to be
+!               processed in calls to mpp_define_nest_domains.
+!               init_nesting subroutine is now used to check if the number of PEs
+!               reserved for the program is equal to the sum of PEs assigned to
+!               all tiles (domains). This is in conjunction with removal of a
+!               similar check within mpp_define_nest_domains, which does not have
+!               necessary context to do the check with multiple nests (only worked
+!               for single-nest configurations).
+!               Also added fixes to indentation and markers to the ends of large
+!               code blocks for clarity.
+!               Bill Ramstrom, AOML/HRD ; Kyle Ahern, AOML/HRD
+!
 !----------------
 ! FV control panel
 !----------------
@@ -87,14 +101,14 @@ module fv_control_mod
   !   </tr>
   !   <tr>
   !     <td>mpp_mod</td>
-  !     <td>mpp_send, mpp_sync, mpp_transmit, mpp_set_current_pelist, mpp_declare_pelist, 
+  !     <td>mpp_send, mpp_sync, mpp_transmit, mpp_set_current_pelist, mpp_declare_pelist,
   !         mpp_root_pe, mpp_recv, mpp_sync_self, mpp_broadcast, read_input_nml,
-  !         FATAL, mpp_error, mpp_pe, stdlog, mpp_npes, mpp_get_current_pelist, 
+  !         FATAL, mpp_error, mpp_pe, stdlog, mpp_npes, mpp_get_current_pelist,
   !         input_nml_file, get_unit, WARNING, read_ascii_file, INPUT_STR_LENGTH</td>
   !   </tr>
   !   <tr>
   !     <td>mpp_domains_mod</td>
-  !     <td>mpp_get_data_domain, mpp_get_compute_domain, domain2D, mpp_define_nest_domains, 
+  !     <td>mpp_get_data_domain, mpp_get_compute_domain, domain2D, mpp_define_nest_domains,
   !        nest_domain_type, mpp_get_global_domain, mpp_get_C2F_index, mpp_get_F2C_index,
   !        mpp_broadcast_domain, CENTER, CORNER, NORTH, EAST, WEST, SOUTH</td>
   !   </tr>
@@ -108,8 +122,8 @@ module fv_control_mod
   !   </tr>
   !   <tr>
   !     <td>tracer_manager_mod</td>
-  !     <td>tm_get_number_tracers => get_number_tracers,tm_get_tracer_index => get_tracer_index,   
-  !         tm_get_tracer_indices => get_tracer_indices, tm_set_tracer_profile => set_tracer_profile, 
+  !     <td>tm_get_number_tracers => get_number_tracers,tm_get_tracer_index => get_tracer_index,
+  !         tm_get_tracer_indices => get_tracer_indices, tm_set_tracer_profile => set_tracer_profile,
   !         tm_get_tracer_names => get_tracer_names,tm_check_if_prognostic=> check_if_prognostic,
   !         tm_register_tracers => register_tracers</td>
   !   </tr>
@@ -453,7 +467,7 @@ contains
           Atm(n)%flagstruct%grid_number => Atm(n)%grid_number
           Atm(n)%gridstruct%regional    => Atm(n)%flagstruct%regional
 
-          ! William Ramstrom - report calls to init_grid
+          ! Bill Ramstrom - report calls to init_grid
           print '("[INFO] gid: ",I0," calling init_grid for grid n ",I0," ntiles ", I0, " grid_name ",A10, " grid_file ", A15)', gid, n, ntiles, grid_name, grid_file
           print '("[INFO] gid: ",I0," calling init_grid for grid n ",I0," npx ", I0, " npy ",I0, " npz ", I0)', gid, npx, npy, npz
           call init_grid(Atm(n), grid_name, grid_file, npx, npy, npz, ndims, ntiles, ng)
@@ -641,7 +655,7 @@ contains
 
     real :: dim0 = 180.           !< base dimension
     real :: dt0  = 1800.          !< base time step
-    real :: ns0  = 5.             !< base nsplit for base dimension 
+    real :: ns0  = 5.             !< base nsplit for base dimension
                                   !< For cubed sphere 5 is better
     !real :: umax = 350.          !< max wave speed for grid_type>3 ! Now defined above
     real :: dimx, dl, dp, dxmin, dymin, d_fac
@@ -1025,7 +1039,7 @@ contains
 
        ! setup_pointers sets all of the variables like
        ! parent_tile, refinement, from the
-       ! neststruct or flagstruct (Ramstrom)
+       ! neststruct or flagstruct [Ramstrom]
        call setup_pointers(Atm(n))
 
        if (nested) then
@@ -1033,12 +1047,13 @@ contains
             call mpp_error(FATAL, 'npx or npy not an even refinement of its coarse grid.')
           endif
 
+          ! Determine which nested domain (tile) we're working with [Ramstrom]
           child_tile = n + 6 - 1
-
-          print '("[INFO] WDR about to call mpp_define_nest_domains for nest n ",I0," parent_tile ", I0," child_tile ", I0)', n, parent_tile, child_tile
+          ! print '("[INFO] WDR about to call mpp_define_nest_domains for nest n ",I0," parent_tile ", I0," child_tile ", I0)', n, parent_tile, child_tile
 
           ! Pelist needs to be set to ALL (which should have been done
           ! in broadcast_domains) to get this to work
+          ! Use variable child_tile to allow for multiple nests [Ramstrom]
           ! CLEANUP: Why do we require this call twice?
           call mpp_define_nest_domains(Atm(n)%neststruct%nest_domain, &
                Atm(n)%domain, Atm(parent_grid_num)%domain, &
@@ -1080,7 +1095,7 @@ contains
        endif ! nested
 
        do nn=1,size(Atm)
-          ! WDR TODO may need to change this for telescoping nests
+          ! TODO may need to change this for telescoping nests [Ramstrom]
           if (n == 1) allocate(Atm(nn)%neststruct%nest_domain_all(size(Atm)))
           Atm(nn)%neststruct%nest_domain_all(n) = Atm(n)%neststruct%nest_domain
        enddo
@@ -1209,7 +1224,7 @@ contains
 
        ! Validate number of PEs -- replacing test that was
        ! in mpp_define_nest_domains.inc because
-       ! context is missing there. (Ramstrom)
+       ! context is missing there. [Ramstrom]
        if (npes .NE. pecounter) then
           call mpp_error(FATAL, "fv_control (init_nesting): number of PEs for run does not match sum of PEs for coarse and fine nests")
        endif
@@ -1228,7 +1243,7 @@ contains
        enddo
 
        ! Can this condition change in the "Set pelists" loop above?
-       ! If not, this is a redundant check. (Ahern)
+       ! If not, this is a redundant check. [Ahern]
        if (pecounter /= npes) then
           print '("[INFO] WDR error in init_nesting: pecounter ",I0," not equal to npres ",I0)', pecounter, npes
           call mpp_error(FATAL, 'nest_pes in nest_nml does not assign all of the available PEs.')
