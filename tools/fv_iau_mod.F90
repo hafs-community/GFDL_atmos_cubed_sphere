@@ -183,9 +183,9 @@ subroutine IAU_initialize (IPD_Control, IAU_Data, Init_parm, Atm)
     if( file_exists(fname) ) then
       call open_ncfile( fname, ncid )        ! open the file
       if (IPD_Control%iau_regional) then
-       call get_ncdim1( ncid, 'nx',   im)
-       call get_ncdim1( ncid, 'ny',   jm)
-       call get_ncdim1( ncid, 'nz',   km)
+       call get_ncdim1( ncid, 'xaxis_1',   im)
+       call get_ncdim1( ncid, 'yaxis_1',   jm)
+       call get_ncdim1( ncid, 'zaxis_1',   km)
       else
        call get_ncdim1( ncid, 'lon',   im)
        call get_ncdim1( ncid, 'lat',   jm)
@@ -281,7 +281,7 @@ subroutine IAU_initialize (IPD_Control, IAU_Data, Init_parm, Atm)
     endif
     if (IPD_Control%iau_regional) iau_state%wt_normfact=iau_state%wt_normfact*IPD_Control%iau_inc_scale
     if ( Atm%flagstruct%increment_file_on_native_grid ) then
-       call read_cubed_sphere_inc('INPUT/'//trim(IPD_Control%iau_inc_files(1)), iau_state%inc1, Atm)
+       call read_cubed_sphere_inc('INPUT/'//trim(IPD_Control%iau_inc_files(1)), iau_state%inc1, Atm, IPD_Control%iau_regional)
     else
        call read_iau_forcing(IPD_Control,iau_state%inc1,'INPUT/'//trim(IPD_Control%iau_inc_files(1)))
     endif
@@ -297,7 +297,7 @@ subroutine IAU_initialize (IPD_Control, IAU_Data, Init_parm, Atm)
        allocate (iau_state%inc2%tracer_inc(is:ie, js:je, km,ntracers))
        iau_state%hr2=IPD_Control%iaufhrs(2)
        if ( Atm%flagstruct%increment_file_on_native_grid ) then
-          call read_cubed_sphere_inc('INPUT/'//trim(IPD_Control%iau_inc_files(2)), iau_state%inc2, Atm)
+          call read_cubed_sphere_inc('INPUT/'//trim(IPD_Control%iau_inc_files(2)), iau_state%inc2, Atm, IPD_Control%iau_regional)
        else
           call read_iau_forcing(IPD_Control,iau_state%inc2,'INPUT/'//trim(IPD_Control%iau_inc_files(2)))
        endif
@@ -361,7 +361,7 @@ subroutine getiauforcing(IPD_Control,IAU_Data,Atm)
          IAU_Data%in_interval=.false.
       else
          if (IPD_Control%iau_filter_increments) call setiauforcing(IPD_Control,IAU_Data,iau_state%wt)
-         if (is_master()) print *,'apply iau forcing t1,t,t2,filter wt=',t1,IPD_Control%fhour,t2,iau_state%wt/iau_state%wt_normfact,iau_state%wt
+         if (is_master()) print *,'apply iau forcing t1,t,t2,filter wt=',t1,IPD_Control%fhour,t2,iau_state%wt/iau_state%wt_normfact
          IAU_Data%in_interval=.true.
       endif
       return
@@ -387,7 +387,7 @@ subroutine getiauforcing(IPD_Control,IAU_Data,Atm)
             iau_state%inc1=iau_state%inc2
             if (is_master()) print *,'reading next increment file',trim(IPD_Control%iau_inc_files(itnext))
             if ( Atm%flagstruct%increment_file_on_native_grid ) then
-               call read_cubed_sphere_inc('INPUT/'//trim(IPD_Control%iau_inc_files(itnext)), iau_state%inc2, Atm)
+               call read_cubed_sphere_inc('INPUT/'//trim(IPD_Control%iau_inc_files(itnext)), iau_state%inc2, Atm, IPD_Control%iau_regional)
             else
                call read_iau_forcing(IPD_Control,iau_state%inc2,'INPUT/'//trim(IPD_Control%iau_inc_files(itnext)))
             endif
@@ -500,25 +500,14 @@ subroutine read_iau_forcing(IPD_Control,increments,fname)
     endif
 
  ! read in 1 time level
-    if (IPD_Control%iau_regional) then
-      call interp_inc2('T_inc',increments%temp_inc)
-      call interp_inc2('delp_inc',increments%delp_inc)
-      call interp_inc2('delz_inc',increments%delz_inc)
-      call interp_inc2('u_inc',increments%ua_inc)
-      call interp_inc2('v_inc',increments%va_inc)
-      do l=1,ntracers
-         call interp_inc2(trim(tracer_names(l))//'_inc',increments%tracer_inc(:,:,:,l))
-      enddo
-    else
-      call interp_inc('T_inc',increments%temp_inc(:,:,:),jbeg,jend)
-      call interp_inc('delp_inc',increments%delp_inc(:,:,:),jbeg,jend)
-      call interp_inc('delz_inc',increments%delz_inc(:,:,:),jbeg,jend)
-      call interp_inc('u_inc',increments%ua_inc(:,:,:),jbeg,jend)   ! can these be treated as scalars?
-      call interp_inc('v_inc',increments%va_inc(:,:,:),jbeg,jend)
-      do l=1,ntracers
-         call interp_inc(trim(tracer_names(l))//'_inc',increments%tracer_inc(:,:,:,l),jbeg,jend)
-      enddo
-    end if
+    call interp_inc('T_inc',increments%temp_inc(:,:,:),jbeg,jend)
+    call interp_inc('delp_inc',increments%delp_inc(:,:,:),jbeg,jend)
+    call interp_inc('delz_inc',increments%delz_inc(:,:,:),jbeg,jend)
+    call interp_inc('u_inc',increments%ua_inc(:,:,:),jbeg,jend)   ! can these be treated as scalars?
+    call interp_inc('v_inc',increments%va_inc(:,:,:),jbeg,jend)
+    do l=1,ntracers
+       call interp_inc(trim(tracer_names(l))//'_inc',increments%tracer_inc(:,:,:,l),jbeg,jend)
+    enddo
     call close_ncfile(ncid)
     deallocate (wk3)
 
@@ -551,22 +540,6 @@ subroutine interp_inc(field_name,var,jbeg,jend)
     enddo
  enddo
 end subroutine interp_inc
-
-subroutine interp_inc2(field_name,var)
-! interpolate increment from GSI gaussian grid to cubed sphere
-! everying is on the A-grid, earth relative
- character(len=*), intent(in) :: field_name
- real, dimension(is:ie,js:je,1:km), intent(inout) :: var
- integer:: i1, i2, j1, k,j,i,ierr
- call check_var_exists(ncid, field_name, ierr)
- if (ierr == 0) then
-    call get_var3_r4( ncid, field_name, 1,im, js,je, 1,km, wk3 )
- else
-    if (is_master()) print *,'warning: no increment for ',trim(field_name),' found, assuming zero'
-    wk3 = 0.
- end if
- var(is:ie,js:je,1:km)=wk3(is:ie,:,:)
-end subroutine interp_inc2
 
 end module fv_iau_mod
 
