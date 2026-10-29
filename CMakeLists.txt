@@ -43,6 +43,8 @@ if(OPENMP)
   find_package(OpenMP REQUIRED)
 endif()
 find_package(NetCDF REQUIRED C Fortran)
+find_package(bacio REQUIRED)
+find_package(g2 REQUIRED)
 if(use_WRTCOMP)
   if(NOT ESMF_FOUND)
   find_package(ESMF REQUIRED)
@@ -204,6 +206,10 @@ target_include_directories(fv3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_compile_definitions(fv3 PRIVATE "${fv3_defs}")
 
 target_link_libraries(fv3 PUBLIC fms)
+
+target_link_libraries(fv3 PRIVATE
+  g2::g2_4
+  bacio::bacio_4)
 
 if(GFS_PHYS)
   target_link_libraries(fv3 PUBLIC fv3ccpp)

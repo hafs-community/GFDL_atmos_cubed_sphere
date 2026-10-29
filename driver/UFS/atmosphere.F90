@@ -556,7 +556,8 @@ contains
 
    if ( Atm(mygrid)%flagstruct%nudge ) then
       call fv_nwp_nudge_init( Time, Atm(mygrid)%atmos_axes, npz, zvir, Atm(mygrid)%ak, Atm(mygrid)%bk, Atm(mygrid)%ts, &
-           Atm(mygrid)%phis, Atm(mygrid)%gridstruct, Atm(mygrid)%ks, Atm(mygrid)%npx, Atm(mygrid)%neststruct, Atm(mygrid)%bd)
+           Atm(mygrid)%phis, Atm(mygrid)%gridstruct, Atm(mygrid)%ks, Atm(mygrid)%npx, Atm(mygrid)%npy, Atm(mygrid)%neststruct, &
+           Atm(mygrid)%bd, Atm(mygrid)%domain, Atm(mygrid)%global_tile)
       call mpp_error(NOTE, 'NWP nudging is active')
    endif
    call fv_io_register_nudge_restart ( Atm )
