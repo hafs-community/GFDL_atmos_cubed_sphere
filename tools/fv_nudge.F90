@@ -363,6 +363,12 @@ module fv_nwp_nudge_mod
   real,    save :: rf_alpha_dx_sum_stored = 0.0, rf_alpha_dy_sum_stored = 0.0
   real,    save :: rf_alpha_dx_sq_sum_stored = 0.0, rf_alpha_dy_sq_sum_stored = 0.0
   real, allocatable, save :: alpha_x_glob(:,:), alpha_y_glob(:,:)
+  ! RF normalization is deterministic for a fixed active alpha field and nf.
+  ! Cache the local normalization so repeated U/V/T RF calls do not refilter
+  ! an identical field of ones.  The cache is invalidated whenever alpha is rebuilt.
+  logical, save :: rf_norm_stored(2) = (/ .false., .false. /)
+  integer, save :: rf_norm_nf_stored(2) = (/ -1, -1 /)
+  real, allocatable, save :: rf_norm_cache(:,:,:)
   ! Centralized cubed-sphere RF storage.  For nudge_option=4 all tiles
   ! are gathered to PE 0.  The third dimension is the FV3 tile number.
   real, allocatable, save :: alpha_x_cube(:,:,:), alpha_y_cube(:,:,:)
@@ -465,12 +471,16 @@ module fv_nwp_nudge_mod
   logical, pointer :: bounded_domain, sw_corner, se_corner, nw_corner, ne_corner
 
   integer :: c0, c1, rate
-  real    :: tcost
+  integer :: c_total0, c_total1, c_obs0, c_obs1
+  real    :: tcost, tcost_obs, tcost_total
   logical :: do_nudge_now
   if ( .not. module_is_initialized ) then
         call mpp_error(FATAL,'==> Error from fv_nwp_nudge: module not initialized')
   endif
-  if (nudge_option .ne. 0) call system_clock(count_rate=rate)
+  if (nudge_option .ne. 0) then
+     call system_clock(count_rate=rate)
+     call system_clock(c_total0)
+  endif
   agrid => gridstruct%agrid_64
    area => gridstruct%area
   rarea => gridstruct%rarea
@@ -660,8 +670,14 @@ module fv_nwp_nudge_mod
   endif
 
 
+  if (nudge_option .ne. 0) call system_clock(c_obs0)
   call get_obs(Time, dt, zvir, ak, bk, ps, ts, ps_obs, delp, pt, nwat, q, u_obs, v_obs, t_obs, q_obs,   &
                phis, ua, va, u_dt, v_dt, npx, npy, npz, factor, factor_nwp, mask, ptop, bd, gridstruct, domain, nudge_tile_num)
+  if (nudge_option .ne. 0) then
+     call system_clock(c_obs1)
+     tcost_obs = real(c_obs1-c_obs0)/real(rate)
+     if (nudge_debug .and. is_master()) write(*,'(a,f10.4,a)') 'NUDGE get_obs cost = ',tcost_obs,' s'
+  endif
 ! *t_obs* is virtual temperature for normal nudging and true temperature for climate_nudging.
 
   if ( no_obs ) then
@@ -1125,6 +1141,15 @@ endif
   nullify(nw_corner)
   nullify(ne_corner)
 
+  if (nudge_option .ne. 0) then
+     call system_clock(c_total1)
+     tcost_total = real(c_total1-c_total0)/real(rate)
+     if (nudge_debug .and. is_master()) then
+        write(*,'(a,f10.4,a,f10.4,a)') 'NUDGE total cost = ',tcost_total, &
+             ' s; outside get_obs = ',tcost_total-tcost_obs,' s'
+     endif
+  endif
+
  end  subroutine fv_nwp_nudge
 
 
@@ -1448,11 +1473,19 @@ endif
   real::  tm(is:ie,js:je)
   real(KIND=4), allocatable,dimension(:,:,:):: ut, vt, wt
   real, allocatable,dimension(:,:,:):: uu, vv
+  integer, allocatable :: grib2_map_m(:,:,:)
+  real, allocatable :: grib2_map_w(:,:,:)
   integer :: seconds, days
   integer :: i,j,k
+  integer :: clk_rate,clk_total0,clk_total1,clk0,clk1
   real :: alpha, beta
+  real :: t_read,t_vmap,t_uvremap,t_tqremap,t_total
   character(len=256) :: fname_tile
   character(len=8)   :: c_tile
+
+  call system_clock(count_rate=clk_rate)
+  call system_clock(clk_total0)
+  t_read=0.0; t_vmap=0.0; t_uvremap=0.0; t_tqremap=0.0
 
   call get_time (time, seconds, days)
 
@@ -1497,6 +1530,7 @@ endif
 !---------------
 ! Read next data
 !---------------
+      call system_clock(clk0)
       nfile = nfile + 1
       if ( nudge_option.eq.0 ) then
         call get_ncep_analysis ( ps_dat(:,:,2), u_dat(:,:,:,2), v_dat(:,:,:,2),    &
@@ -1521,6 +1555,8 @@ endif
       else
         if(master)  write(*,*) 'Nudging regional option not available, WIP'
       end if
+      call system_clock(clk1)
+      t_read=real(clk1-clk0)/real(clk_rate)
       time_nudge = dt
   else
       time_nudge = time_nudge + dt
@@ -1593,6 +1629,16 @@ endif
   allocate ( ut(is:ie,js:je,npz) )
   allocate ( vt(is:ie,js:je,npz) )
 
+  if (grib2_input) then
+     allocate(grib2_map_m(is:ie,js:je,npz),grib2_map_w(is:ie,js:je,npz))
+     call system_clock(clk0)
+     call build_grib2_vertical_map(npz,ak,ps(is:ie,js:je),delp,km,grib2_plev_pa, &
+                                   grib2_map_m,grib2_map_w)
+     call system_clock(clk1)
+     t_vmap=real(clk1-clk0)/real(clk_rate)
+  endif
+
+  call system_clock(clk0)
   if ( nudge_winds ) then
 
      if ( nudge_option.eq.0 ) then
@@ -1600,7 +1646,8 @@ endif
                      km, ps_dat(is:ie,js:je,1),  u_dat(:,:,:,1), v_dat(:,:,:,1), ptop )
      else if ( grib2_input ) then
        call remap_uv_grib2(npz, ak, bk, ps(is:ie,js:je), delp, ut, vt, &
-                     km, grib2_plev_pa, u_dat(:,:,:,1), v_dat(:,:,:,1), ptop)
+                     km, grib2_plev_pa, u_dat(:,:,:,1), v_dat(:,:,:,1), ptop, &
+                     grib2_map_m,grib2_map_w)
      else
        call remap_uv_regional(npz, ak, bk, ps(is:ie,js:je), delp, ut, vt, &
                      km, dp_dat(:,:,:,1), u_dat(:,:,:,1), v_dat(:,:,:,1), ptop )
@@ -1614,7 +1661,8 @@ endif
                      km, ps_dat(is:ie,js:je,2),  u_dat(:,:,:,2), v_dat(:,:,:,2), ptop )
      else if ( grib2_input ) then
        call remap_uv_grib2(npz, ak, bk, ps(is:ie,js:je), delp, ut, vt, &
-                     km, grib2_plev_pa, u_dat(:,:,:,2), v_dat(:,:,:,2), ptop)
+                     km, grib2_plev_pa, u_dat(:,:,:,2), v_dat(:,:,:,2), ptop, &
+                     grib2_map_m,grib2_map_w)
      else
        call remap_uv_regional(npz, ak, bk, ps(is:ie,js:je), delp, ut, vt, &
                      km, dp_dat(:,:,:,2), u_dat(:,:,:,2), v_dat(:,:,:,2), ptop )
@@ -1623,12 +1671,17 @@ endif
        u_obs(:,:,:) = u_obs(:,:,:) + beta*ut(:,:,:)
        v_obs(:,:,:) = v_obs(:,:,:) + beta*vt(:,:,:)
   endif
+  call system_clock(clk1)
+  t_uvremap=real(clk1-clk0)/real(clk_rate)
+
+  call system_clock(clk0)
      if ( nudge_option.eq.0 ) then
        call remap_tq(npz, ak, bk, ps(is:ie,js:je), delp,  ut,  vt,  &
                      km,  ps_dat(is:ie,js:je,1),  t_dat(:,:,:,1), q_dat(:,:,:,1), zvir, ptop)
      else if ( grib2_input ) then
        call remap_tq_grib2(npz, ak, bk, ps(is:ie,js:je), delp, ut, vt, &
-                     km, grib2_plev_pa, t_dat(:,:,:,1), q_dat(:,:,:,1), zvir, ptop)
+                     km, grib2_plev_pa, t_dat(:,:,:,1), q_dat(:,:,:,1), zvir, ptop, &
+                     grib2_map_m,grib2_map_w)
      else
        call remap_tq_regional(npz, ak, bk, ps(is:ie,js:je), delp, ut, vt, &
                      km, dp_dat(:,:,:,1), t_dat(:,:,:,1), q_dat(:,:,:,1), zvir, ptop)
@@ -1642,7 +1695,8 @@ endif
                      km,  ps_dat(is:ie,js:je,2),  t_dat(:,:,:,2), q_dat(:,:,:,2), zvir, ptop)
      else if ( grib2_input ) then
        call remap_tq_grib2(npz, ak, bk, ps(is:ie,js:je), delp, ut, vt, &
-                     km, grib2_plev_pa, t_dat(:,:,:,2), q_dat(:,:,:,2), zvir, ptop)
+                     km, grib2_plev_pa, t_dat(:,:,:,2), q_dat(:,:,:,2), zvir, ptop, &
+                     grib2_map_m,grib2_map_w)
      else
        call remap_tq_regional(npz, ak, bk, ps(is:ie,js:je), delp, ut, vt, &
                      km, dp_dat(:,:,:,2), t_dat(:,:,:,2), q_dat(:,:,:,2), zvir, ptop)
@@ -1651,8 +1705,20 @@ endif
        t_obs(:,:,:) = t_obs(:,:,:) + beta*ut(:,:,:)
        q_obs(:,:,:) = q_obs(:,:,:) + beta*vt(:,:,:)
 
+  call system_clock(clk1)
+  t_tqremap=real(clk1-clk0)/real(clk_rate)
+
+  if (allocated(grib2_map_m)) deallocate(grib2_map_m)
+  if (allocated(grib2_map_w)) deallocate(grib2_map_w)
   deallocate ( ut )
   deallocate ( vt )
+
+  call system_clock(clk_total1)
+  t_total=real(clk_total1-clk_total0)/real(clk_rate)
+  if (nudge_debug .and. master .and. nudge_option.ne.0) then
+     write(*,'(a,5(f10.4,a))') 'get_obs timing: read=',t_read,' s, vmap=',t_vmap, &
+          ' s, uvremap=',t_uvremap,' s, tqremap=',t_tqremap,' s, total=',t_total,' s'
+  endif
 
  end subroutine get_obs
 
@@ -2507,14 +2573,21 @@ subroutine grib2_init_grid(fname, agrid, domain)
   type(domain2d), intent(inout) :: domain
 
   integer :: mype, root, npelist, n, ierr_g2, lugb
+  integer :: clk_rate,clk_total0,clk_total1,clk0,clk1
   integer, allocatable :: pelist(:)
   real, allocatable :: sample(:,:), sample_valid(:,:), lon_deg(:), lat_deg(:)
   real :: dlon, lon_tol, lat_tol
+  real :: t_gridread,t_map,t_total
+
+  call system_clock(count_rate=clk_rate)
+  call system_clock(clk_total0)
+  t_gridread=0.0; t_map=0.0
 
   mype = mpp_pe()
-  call get_rf_domain_pelist(domain,pelist,npelist,root)
+  call get_grib2_domain_pelist(domain,pelist,npelist,root)
 
   if (mype == root) then
+    call system_clock(clk0)
     lugb = 91
     call baopenr(lugb,trim(fname),ierr_g2)
     if (ierr_g2 /= 0) then
@@ -2529,6 +2602,8 @@ subroutine grib2_init_grid(fname, agrid, domain)
 
     call baclose(lugb,ierr_g2)
     call gf_finalize(ierr_g2)
+    call system_clock(clk1)
+    t_gridread=real(clk1-clk0)/real(clk_rate)
   endif
 
   if (mype == root) then
@@ -2582,7 +2657,10 @@ subroutine grib2_init_grid(fname, agrid, domain)
   allocate(id2(is:ie,js:je))
   allocate(jdc(is:ie,js:je))
 
+  call system_clock(clk0)
   call remap_coef(agrid)
+  call system_clock(clk1)
+  t_map=real(clk1-clk0)/real(clk_rate)
 
   if (mype == root .and. nudge_debug) then
     write(*,'(a,2i8)') 'GRIB2 source grid im,jm = ',im,jm
@@ -2599,6 +2677,12 @@ subroutine grib2_init_grid(fname, agrid, domain)
     if (allocated(lat_deg)) deallocate(lat_deg)
   endif
   deallocate(pelist)
+  call system_clock(clk_total1)
+  t_total=real(clk_total1-clk_total0)/real(clk_rate)
+  if (mype == root .and. nudge_debug) then
+    write(*,'(a,3(f10.4,a))') 'GRIB2 grid init timing: gridread=',t_gridread,' s, remap_coef=', &
+         t_map,' s, total=',t_total,' s'
+  endif
 end subroutine grib2_init_grid
 
 subroutine get_grib2_analysis(ps,u,v,t,q,dp,nfile,fname,domain,zvir)
@@ -2617,12 +2701,14 @@ subroutine get_grib2_analysis(ps,u,v,t,q,dp,nfile,fname,domain,zvir)
   real(kind=4), intent(out) :: q(is:ie,js:je,km)
   real(kind=4), intent(out) :: dp(is:ie,js:je,km)
 
-  integer :: i,j,k,i1,i2,j1
+  integer :: k
   integer :: mype,root,npelist,lugb,ierr_g2
+  integer :: clk0,clk1,clk_total0,clk_total1,clk_rate
   integer, allocatable :: pelist(:)
   real, allocatable :: src(:,:), src_valid(:,:), lon_dummy(:), lat_dummy(:)
   logical, allocatable :: u_ok(:,:,:), v_ok(:,:,:), t_ok(:,:,:), q_ok(:,:,:)
-  real :: c1,c2,c3,c4,wsum
+  logical :: field_all_valid
+  real :: t_decode,t_bcast,t_hinterp,t_post,t_total
 
   if (.not. file_exists(fname)) then
     call mpp_error(FATAL,'get_grib2_analysis: file not found '//trim(fname))
@@ -2631,14 +2717,22 @@ subroutine get_grib2_analysis(ps,u,v,t,q,dp,nfile,fname,domain,zvir)
     call mpp_error(FATAL,'get_grib2_analysis: km must equal grib2_nplev')
   endif
 
+  call system_clock(count_rate=clk_rate)
+  call system_clock(clk_total0)
+  t_decode=0.0; t_bcast=0.0; t_hinterp=0.0; t_post=0.0
+
   mype = mpp_pe()
-  call get_rf_domain_pelist(domain,pelist,npelist,root)
+  ! GRIB2 source data are global and identical for every FV3 tile.  Use the
+  ! complete domain PE list here rather than the RF tile-local group so that
+  ! nudge_option=4 decodes each GRIB2 field only once, not once per cube face.
+  call get_grib2_domain_pelist(domain,pelist,npelist,root)
 
   allocate(src(im,jm),src_valid(im,jm))
   allocate(u_ok(is:ie,js:je,km),v_ok(is:ie,js:je,km))
   allocate(t_ok(is:ie,js:je,km),q_ok(is:ie,js:je,km))
   src = 0.0
   src_valid = 1.0
+  field_all_valid=.false.
   u_ok=.false.; v_ok=.false.; t_ok=.false.; q_ok=.false.
 
   if (mype == root) then
@@ -2647,7 +2741,10 @@ subroutine get_grib2_analysis(ps,u,v,t,q,dp,nfile,fname,domain,zvir)
     if (ierr_g2 /= 0) then
       call mpp_error(FATAL,'get_grib2_analysis: cannot open '//trim(fname))
     endif
-    if (nudge_debug) write(*,*) 'Reading pressure-level GRIB2: ',trim(fname)
+    if (nudge_debug) then
+      write(*,*) 'Reading pressure-level GRIB2: ',trim(fname)
+      write(*,'(a,i8,a,i8)') 'GRIB2 I/O group: root=',root,' npes=',npelist
+    endif
   endif
 
   ! Pressure-level GRIB2 does not provide source surface pressure in the
@@ -2663,100 +2760,81 @@ subroutine get_grib2_analysis(ps,u,v,t,q,dp,nfile,fname,domain,zvir)
   do k=1,km
     ! UGRD: category 2, parameter 2.
     if (mype == root) then
+      call system_clock(clk0)
       call grib2_read_field_open(lugb,2,2,nint(grib2_plev_pa(k)), &
-                                       src,src_valid,lon_dummy,lat_dummy,.false.,k==1,.true.)
+                                       src,src_valid,lon_dummy,lat_dummy,.false.,k==1,.true.,field_all_valid)
+      call system_clock(clk1)
+      t_decode=t_decode+real(clk1-clk0)/real(clk_rate)
     endif
-    call rf_pelist_broadcast_real(src(1,1),im*jm,root,pelist,npelist)
-    call rf_pelist_broadcast_real(src_valid(1,1),im*jm,root,pelist,npelist)
-    do j=js,je
-      do i=is,ie
-        i1=id1(i,j); i2=id2(i,j); j1=jdc(i,j)
-        c1=s2c(i,j,1); c2=s2c(i,j,2); c3=s2c(i,j,3); c4=s2c(i,j,4)
-        wsum=c1*src_valid(i1,j1)+c2*src_valid(i2,j1)+ &
-             c3*src_valid(i2,j1+1)+c4*src_valid(i1,j1+1)
-        if (wsum > 1.e-12) then
-          u(i,j,k)=(c1*src_valid(i1,j1)*src(i1,j1)+ &
-                    c2*src_valid(i2,j1)*src(i2,j1)+ &
-                    c3*src_valid(i2,j1+1)*src(i2,j1+1)+ &
-                    c4*src_valid(i1,j1+1)*src(i1,j1+1))/wsum
-          u_ok(i,j,k)=.true.
-        endif
-      enddo
-    enddo
+    call system_clock(clk0)
+    call grib2_broadcast_source(src(1,1),src_valid(1,1),im*jm,field_all_valid, &
+                                root,pelist,npelist)
+    call system_clock(clk1)
+    if (mype == root) t_bcast=t_bcast+real(clk1-clk0)/real(clk_rate)
+    call system_clock(clk0)
+    call grib2_horizontal_interp(src,src_valid,u(:,:,k),u_ok(:,:,k))
+    call system_clock(clk1)
+    if (mype == root) t_hinterp=t_hinterp+real(clk1-clk0)/real(clk_rate)
 
     ! VGRD: category 2, parameter 3.
     if (mype == root) then
+      call system_clock(clk0)
       call grib2_read_field_open(lugb,2,3,nint(grib2_plev_pa(k)), &
-                                       src,src_valid,lon_dummy,lat_dummy,.false.,.false.,.true.)
+                                       src,src_valid,lon_dummy,lat_dummy,.false.,.false.,.true.,field_all_valid)
+      call system_clock(clk1)
+      t_decode=t_decode+real(clk1-clk0)/real(clk_rate)
     endif
-    call rf_pelist_broadcast_real(src(1,1),im*jm,root,pelist,npelist)
-    call rf_pelist_broadcast_real(src_valid(1,1),im*jm,root,pelist,npelist)
-    do j=js,je
-      do i=is,ie
-        i1=id1(i,j); i2=id2(i,j); j1=jdc(i,j)
-        c1=s2c(i,j,1); c2=s2c(i,j,2); c3=s2c(i,j,3); c4=s2c(i,j,4)
-        wsum=c1*src_valid(i1,j1)+c2*src_valid(i2,j1)+ &
-             c3*src_valid(i2,j1+1)+c4*src_valid(i1,j1+1)
-        if (wsum > 1.e-12) then
-          v(i,j,k)=(c1*src_valid(i1,j1)*src(i1,j1)+ &
-                    c2*src_valid(i2,j1)*src(i2,j1)+ &
-                    c3*src_valid(i2,j1+1)*src(i2,j1+1)+ &
-                    c4*src_valid(i1,j1+1)*src(i1,j1+1))/wsum
-          v_ok(i,j,k)=.true.
-        endif
-      enddo
-    enddo
+    call system_clock(clk0)
+    call grib2_broadcast_source(src(1,1),src_valid(1,1),im*jm,field_all_valid, &
+                                root,pelist,npelist)
+    call system_clock(clk1)
+    if (mype == root) t_bcast=t_bcast+real(clk1-clk0)/real(clk_rate)
+    call system_clock(clk0)
+    call grib2_horizontal_interp(src,src_valid,v(:,:,k),v_ok(:,:,k))
+    call system_clock(clk1)
+    if (mype == root) t_hinterp=t_hinterp+real(clk1-clk0)/real(clk_rate)
 
     ! TMP: category 0, parameter 0.  GRIB2 TMP is true temperature.
     if (mype == root) then
+      call system_clock(clk0)
       call grib2_read_field_open(lugb,0,0,nint(grib2_plev_pa(k)), &
-                                       src,src_valid,lon_dummy,lat_dummy,.false.,.false.,.true.)
+                                       src,src_valid,lon_dummy,lat_dummy,.false.,.false.,.true.,field_all_valid)
+      call system_clock(clk1)
+      t_decode=t_decode+real(clk1-clk0)/real(clk_rate)
     endif
-    call rf_pelist_broadcast_real(src(1,1),im*jm,root,pelist,npelist)
-    call rf_pelist_broadcast_real(src_valid(1,1),im*jm,root,pelist,npelist)
-    do j=js,je
-      do i=is,ie
-        i1=id1(i,j); i2=id2(i,j); j1=jdc(i,j)
-        c1=s2c(i,j,1); c2=s2c(i,j,2); c3=s2c(i,j,3); c4=s2c(i,j,4)
-        wsum=c1*src_valid(i1,j1)+c2*src_valid(i2,j1)+ &
-             c3*src_valid(i2,j1+1)+c4*src_valid(i1,j1+1)
-        if (wsum > 1.e-12) then
-          t(i,j,k)=(c1*src_valid(i1,j1)*src(i1,j1)+ &
-                    c2*src_valid(i2,j1)*src(i2,j1)+ &
-                    c3*src_valid(i2,j1+1)*src(i2,j1+1)+ &
-                    c4*src_valid(i1,j1+1)*src(i1,j1+1))/wsum
-          t_ok(i,j,k)=.true.
-        endif
-      enddo
-    enddo
+    call system_clock(clk0)
+    call grib2_broadcast_source(src(1,1),src_valid(1,1),im*jm,field_all_valid, &
+                                root,pelist,npelist)
+    call system_clock(clk1)
+    if (mype == root) t_bcast=t_bcast+real(clk1-clk0)/real(clk_rate)
+    call system_clock(clk0)
+    call grib2_horizontal_interp(src,src_valid,t(:,:,k),t_ok(:,:,k))
+    call system_clock(clk1)
+    if (mype == root) t_hinterp=t_hinterp+real(clk1-clk0)/real(clk_rate)
 
     ! SPFH: category 1, parameter 0.  It is needed for Tv in the normal
     ! nudging path and for q_obs in climate height nudging, even when q itself
     ! is not nudged.  Individual pressure levels are optional and are filled
     ! vertically below; an entirely missing q profile remains a fatal error.
     if (mype == root) then
+      call system_clock(clk0)
       call grib2_read_field_open(lugb,1,0,nint(grib2_plev_pa(k)), &
-                                       src,src_valid,lon_dummy,lat_dummy,.false.,.false.,.false.)
+                                       src,src_valid,lon_dummy,lat_dummy,.false.,.false.,.false.,field_all_valid)
+      call system_clock(clk1)
+      t_decode=t_decode+real(clk1-clk0)/real(clk_rate)
     endif
-    call rf_pelist_broadcast_real(src(1,1),im*jm,root,pelist,npelist)
-    call rf_pelist_broadcast_real(src_valid(1,1),im*jm,root,pelist,npelist)
-    do j=js,je
-      do i=is,ie
-        i1=id1(i,j); i2=id2(i,j); j1=jdc(i,j)
-        c1=s2c(i,j,1); c2=s2c(i,j,2); c3=s2c(i,j,3); c4=s2c(i,j,4)
-        wsum=c1*src_valid(i1,j1)+c2*src_valid(i2,j1)+ &
-             c3*src_valid(i2,j1+1)+c4*src_valid(i1,j1+1)
-        if (wsum > 1.e-12) then
-          q(i,j,k)=(c1*src_valid(i1,j1)*src(i1,j1)+ &
-                    c2*src_valid(i2,j1)*src(i2,j1)+ &
-                    c3*src_valid(i2,j1+1)*src(i2,j1+1)+ &
-                    c4*src_valid(i1,j1+1)*src(i1,j1+1))/wsum
-          q_ok(i,j,k)=.true.
-        endif
-      enddo
-    enddo
+    call system_clock(clk0)
+    call grib2_broadcast_source(src(1,1),src_valid(1,1),im*jm,field_all_valid, &
+                                root,pelist,npelist)
+    call system_clock(clk1)
+    if (mype == root) t_bcast=t_bcast+real(clk1-clk0)/real(clk_rate)
+    call system_clock(clk0)
+    call grib2_horizontal_interp(src,src_valid,q(:,:,k),q_ok(:,:,k))
+    call system_clock(clk1)
+    if (mype == root) t_hinterp=t_hinterp+real(clk1-clk0)/real(clk_rate)
   enddo
 
+  call system_clock(clk0)
   ! NCEPLIBS-g2 expands bitmap-missing values to zero.  Do not let those
   ! zeros enter the nudging fields.  Horizontal interpolation above is
   ! renormalized over valid corners, and any pressure level still missing at
@@ -2771,19 +2849,23 @@ subroutine get_grib2_analysis(ps,u,v,t,q,dp,nfile,fname,domain,zvir)
   ! climate_nudging branch expects true temperature, so leave TMP unchanged
   ! there and retain q separately for the height-nudging calculation.
   if ( .not. climate_nudging ) then
+!$OMP parallel do private(k) schedule(static)
     do k=1,km
-      do j=js,je
-        do i=is,ie
-          t(i,j,k)=t(i,j,k)*(1.0+zvir*q(i,j,k))
-        enddo
-      enddo
+      t(:,:,k)=t(:,:,k)*(1.0+zvir*q(:,:,k))
     enddo
+!$OMP end parallel do
   endif
+  call system_clock(clk1)
+  if (mype == root) t_post=real(clk1-clk0)/real(clk_rate)
 
   if (mype == root) then
     call baclose(lugb,ierr_g2)
     call gf_finalize(ierr_g2)
+    call system_clock(clk_total1)
+    t_total=real(clk_total1-clk_total0)/real(clk_rate)
     if (nudge_debug) then
+      write(*,'(a,5(f10.4,a))') 'GRIB2 timing: decode=',t_decode,' s, bcast=',t_bcast, &
+           ' s, horiz=',t_hinterp,' s, post=',t_post,' s, total=',t_total,' s'
       write(*,'(a,2es16.6)') 'GRIB2 U min/max = ',minval(u),maxval(u)
       write(*,'(a,2es16.6)') 'GRIB2 V min/max = ',minval(v),maxval(v)
       if (climate_nudging) then
@@ -2797,6 +2879,65 @@ subroutine get_grib2_analysis(ps,u,v,t,q,dp,nfile,fname,domain,zvir)
   deallocate(src,src_valid,pelist)
   deallocate(u_ok,v_ok,t_ok,q_ok)
 end subroutine get_grib2_analysis
+
+! Perform the existing validity-aware bilinear interpolation on one decoded
+! pressure-level field.  This is algebraically identical to the former inline
+! loops; OpenMP only distributes independent FV3 target points.
+subroutine grib2_horizontal_interp(src,src_valid,out,ok)
+  implicit none
+  real, intent(in) :: src(im,jm),src_valid(im,jm)
+  real(kind=4), intent(out) :: out(is:ie,js:je)
+  logical, intent(out) :: ok(is:ie,js:je)
+  integer :: i,j,i1,i2,j1
+  real :: c1,c2,c3,c4,wsum
+
+!$OMP parallel do private(i,i1,i2,j1,c1,c2,c3,c4,wsum) schedule(static)
+  do j=js,je
+    do i=is,ie
+      i1=id1(i,j); i2=id2(i,j); j1=jdc(i,j)
+      c1=s2c(i,j,1); c2=s2c(i,j,2); c3=s2c(i,j,3); c4=s2c(i,j,4)
+      wsum=c1*src_valid(i1,j1)+c2*src_valid(i2,j1)+ &
+           c3*src_valid(i2,j1+1)+c4*src_valid(i1,j1+1)
+      if (wsum > 1.e-12) then
+        out(i,j)=(c1*src_valid(i1,j1)*src(i1,j1)+ &
+                  c2*src_valid(i2,j1)*src(i2,j1)+ &
+                  c3*src_valid(i2,j1+1)*src(i2,j1+1)+ &
+                  c4*src_valid(i1,j1+1)*src(i1,j1+1))/wsum
+        ok(i,j)=.true.
+      else
+        out(i,j)=0.0
+        ok(i,j)=.false.
+      endif
+    enddo
+  enddo
+!$OMP end parallel do
+end subroutine grib2_horizontal_interp
+
+! Broadcast one decoded GRIB2 source field to the active PE group.
+! For the common no-bitmap case, valid_mask is identically one and is rebuilt
+! locally instead of transferring another full global array.  One synchronization
+! covers the flag, field, and optional bitmap mask, preserving the original values.
+subroutine grib2_broadcast_source(field,valid_mask,nwords,all_valid,root,pelist,npelist)
+  use mpp_mod, only: mpp_pe, mpp_broadcast
+  implicit none
+  integer, intent(in) :: nwords,root,npelist
+  integer, intent(in) :: pelist(npelist)
+  real, intent(inout) :: field(nwords),valid_mask(nwords)
+  logical, intent(inout) :: all_valid
+  integer :: mype
+  real :: flag(1)
+
+  mype=mpp_pe()
+  if (mype == root) flag(1)=merge(1.0,0.0,all_valid)
+  call mpp_broadcast(flag,1,root,pelist)
+  all_valid=(flag(1) > 0.5)
+  call mpp_broadcast(field,nwords,root,pelist)
+  if (all_valid) then
+    valid_mask(:)=1.0
+  else
+    call mpp_broadcast(valid_mask,nwords,root,pelist)
+  endif
+end subroutine grib2_broadcast_source
 
 subroutine fill_grib2_vertical_missing(field,valid,kmd,plev_pa,vname)
   use mpp_mod, only: mpp_error, FATAL, mpp_pe
@@ -2847,23 +2988,26 @@ subroutine fill_grib2_vertical_missing(field,valid,kmd,plev_pa,vname)
   enddo
 end subroutine fill_grib2_vertical_missing
 
-subroutine grib2_read_field_open(lugb,category,param,plev_pa,field,valid_mask,lon_deg,lat_deg,return_grid,new_file,required)
+subroutine grib2_read_field_open(lugb,category,param,plev_pa,field,valid_mask, &
+                                 lon_deg,lat_deg,return_grid,new_file,required,all_valid)
   use grib_mod, only: gribfield
   use mpp_mod,  only: mpp_error, FATAL
   implicit none
   integer, intent(in) :: lugb,category,param,plev_pa
   logical, intent(in) :: return_grid,new_file,required
+  logical, intent(out), optional :: all_valid
   real, allocatable, intent(inout) :: field(:,:),valid_mask(:,:),lon_deg(:),lat_deg(:)
 
   type(gribfield) :: gfld
   integer :: jdisc,jpdtn,jgdtn,jskp,kfound,iret
   integer :: jids(200),jpdt(200),jgdt(200)
-  integer :: nx_raw,ny,nx_out,scan,i,j,idx,iw,nfirst
+  integer :: nx_raw,ny,nx_out,scan,i,j,idx,iw,nfirst,ican,iraw,jraw
   integer :: sf,sv
   real :: unit_deg,lon1,lat1,lon2,lat2,di,dj,si,sj,span,pfound,tol_pa,tol_lon
-  real, allocatable :: raw(:,:),work(:,:),work_valid(:,:),tmp(:,:),tmp_valid(:,:),lon_work(:)
-  logical :: ineg,jpos,jconsecutive,alternate,level_found
+  real, allocatable :: lon_work(:)
+  logical :: ineg,jpos,jconsecutive,alternate,level_found,has_bitmap
 
+  if (present(all_valid)) all_valid=.false.
   if (new_file) grib2_time_match_set=.false.
 
   jdisc = 0
@@ -2978,42 +3122,8 @@ subroutine grib2_read_field_open(lugb,category,param,plev_pa,field,valid_mask,lo
     call mpp_error(FATAL,'GRIB2 reader supports only i-consecutive, non-alternating scan order')
   endif
 
-  allocate(raw(nx_raw,ny),work(nx_raw,ny),work_valid(nx_raw,ny))
-  raw = reshape(gfld%fld(1:nx_raw*ny),(/nx_raw,ny/))
-  work_valid=1.0
-  if (gfld%ibmap /= 255 .and. associated(gfld%bmap)) then
-    do j=1,ny
-      do i=1,nx_raw
-        idx=(j-1)*nx_raw+i
-        if (.not.gfld%bmap(idx)) work_valid(i,j)=0.0
-      enddo
-    enddo
-  endif
-
-  ! Canonicalize the field and bitmap to increasing i and increasing j.
-  if (ineg) then
-    do j=1,ny
-      do i=1,nx_raw
-        work(i,j)=raw(nx_raw+1-i,j)
-      enddo
-    enddo
-    allocate(tmp_valid(nx_raw,ny))
-    tmp_valid=work_valid(nx_raw:1:-1,:)
-    work_valid=tmp_valid
-    deallocate(tmp_valid)
-  else
-    work=raw
-  endif
-  if (.not.jpos) then
-    allocate(tmp(nx_raw,ny),tmp_valid(nx_raw,ny))
-    do j=1,ny
-      tmp(:,j)=work(:,ny+1-j)
-      tmp_valid(:,j)=work_valid(:,ny+1-j)
-    enddo
-    work=tmp
-    work_valid=tmp_valid
-    deallocate(tmp,tmp_valid)
-  endif
+  has_bitmap=(gfld%ibmap /= 255 .and. associated(gfld%bmap))
+  if (present(all_valid)) all_valid=.not.has_bitmap
 
   if (return_grid) then
     grib2_raw_im=nx_raw
@@ -3105,15 +3215,9 @@ subroutine grib2_read_field_open(lugb,category,param,plev_pa,field,valid_mask,lo
     if (grib2_lon_start > 1) then
       iw=grib2_lon_start
       nfirst=nx_out-iw+1
-      field(1:nfirst,:)=work(iw:nx_out,:)
-      field(nfirst+1:nx_out,:)=work(1:iw-1,:)
-      valid_mask(1:nfirst,:)=work_valid(iw:nx_out,:)
-      valid_mask(nfirst+1:nx_out,:)=work_valid(1:iw-1,:)
       lon_deg(1:nfirst)=lon_work(iw:nx_out)
       lon_deg(nfirst+1:nx_out)=lon_work(1:iw-1)
     else
-      field=work(1:nx_out,:)
-      valid_mask=work_valid(1:nx_out,:)
       lon_deg=lon_work(1:nx_out)
     endif
 
@@ -3149,22 +3253,127 @@ subroutine grib2_read_field_open(lugb,category,param,plev_pa,field,valid_mask,lo
     if (size(valid_mask,1)/=nx_out .or. size(valid_mask,2)/=ny) then
       deallocate(valid_mask); allocate(valid_mask(nx_out,ny))
     endif
-    if (grib2_lon_start > 1) then
-      iw=grib2_lon_start
-      nfirst=nx_out-iw+1
-      field(1:nfirst,:)=work(iw:nx_out,:)
-      field(nfirst+1:nx_out,:)=work(1:iw-1,:)
-      valid_mask(1:nfirst,:)=work_valid(iw:nx_out,:)
-      valid_mask(nfirst+1:nx_out,:)=work_valid(1:iw-1,:)
-    else
-      field=work(1:nx_out,:)
-      valid_mask=work_valid(1:nx_out,:)
-    endif
   endif
 
-  deallocate(raw,work,work_valid)
+  ! Directly map the decoded GRIB2 storage order into the final canonical
+  ! increasing-latitude/increasing-longitude array.  This replaces the former
+  ! raw -> work -> tmp -> field full-grid copies while preserving every value.
+  if (.not.has_bitmap) valid_mask(:,:)=1.0
+!$OMP parallel do private(i,ican,iraw,jraw,idx,nfirst) schedule(static)
+  do j=1,ny
+    if (jpos) then
+      jraw=j
+    else
+      jraw=ny+1-j
+    endif
+    do i=1,nx_out
+      if (grib2_lon_start > 1) then
+        nfirst=nx_out-grib2_lon_start+1
+        if (i <= nfirst) then
+          ican=grib2_lon_start+i-1
+        else
+          ican=i-nfirst
+        endif
+      else
+        ican=i
+      endif
+      if (ineg) then
+        iraw=nx_raw+1-ican
+      else
+        iraw=ican
+      endif
+      idx=(jraw-1)*nx_raw+iraw
+      field(i,j)=gfld%fld(idx)
+      if (has_bitmap) then
+        if (gfld%bmap(idx)) then
+          valid_mask(i,j)=1.0
+        else
+          valid_mask(i,j)=0.0
+        endif
+      endif
+    enddo
+  enddo
+!$OMP end parallel do
+
   call gf_free(gfld)
 end subroutine grib2_read_field_open
+
+! Build the pressure-level -> current FV3 full-level interpolation map once.
+! map_m is the upper source index and map_w is the exact log(p) weight used by
+! remap_tq_grib2/remap_uv_grib2.  Reusing this map removes repeated pressure
+! reconstruction, LOG operations, and source-level searches without changing
+! the interpolation formula applied to any field.
+subroutine build_grib2_vertical_map(npz,ak,ps,delp,kmd,plev_pa,map_m,map_w)
+  integer, intent(in) :: npz,kmd
+  real, intent(in) :: ak(npz+1)
+  real, intent(inout) :: ps(is:ie,js:je)
+  real, intent(in) :: delp(isd:ied,jsd:jed,npz)
+  real, intent(in) :: plev_pa(kmd)
+  integer, intent(out) :: map_m(is:ie,js:je,npz)
+  real, intent(out) :: map_w(is:ie,js:je,npz)
+
+  real :: lplev(kmd)
+  real :: pe1(is:ie,npz+1),pfull(is:ie,npz)
+  real :: lpfull,w
+  real, parameter :: pe_top_eps=1.e-9
+  integer :: i,j,k,m,kbot_src,muse
+
+  if (kmd < 2) call mpp_error(FATAL,'build_grib2_vertical_map: at least two pressure levels are required')
+  do k=1,kmd
+    if (plev_pa(k) <= 0.0) call mpp_error(FATAL,'build_grib2_vertical_map: source pressure levels must be positive')
+    lplev(k)=log(plev_pa(k))
+  enddo
+  do k=2,kmd
+    if (plev_pa(k) <= plev_pa(k-1)) then
+      call mpp_error(FATAL,'build_grib2_vertical_map: source pressure levels must increase downward')
+    endif
+  enddo
+
+  do j=js,je
+    do i=is,ie
+      pe1(i,1)=max(pe_top_eps,ak(1))
+    enddo
+    do k=1,npz
+      do i=is,ie
+        pe1(i,k+1)=pe1(i,k)+delp(i,j,k)
+        if (pe1(i,k+1) <= pe1(i,k)) then
+          call mpp_error(FATAL,'build_grib2_vertical_map: non-positive model layer pressure thickness')
+        endif
+        pfull(i,k)=(pe1(i,k+1)-pe1(i,k))/log(pe1(i,k+1)/pe1(i,k))
+      enddo
+    enddo
+    do i=is,ie
+      ps(i,j)=pe1(i,npz+1)
+      kbot_src=1
+      do m=2,kmd
+        if (plev_pa(m) <= pe1(i,npz+1)) kbot_src=m
+      enddo
+      kbot_src=max(2,kbot_src)
+      do k=1,npz
+        lpfull=log(pfull(i,k))
+        if (pfull(i,k) <= plev_pa(1)) then
+          muse=1
+          w=max(-1.0,(lpfull-lplev(1))/(lplev(2)-lplev(1)))
+        else if (pfull(i,k) >= plev_pa(kbot_src)) then
+          muse=kbot_src-1
+          w=min(2.0,(lpfull-lplev(kbot_src-1))/(lplev(kbot_src)-lplev(kbot_src-1)))
+        else
+          muse=1
+          w=0.0
+          do m=1,kbot_src-1
+            if (pfull(i,k) >= plev_pa(m) .and. pfull(i,k) <= plev_pa(m+1)) then
+              muse=m
+              w=(lpfull-lplev(m))/(lplev(m+1)-lplev(m))
+              exit
+            endif
+          enddo
+        endif
+        map_m(i,j,k)=muse
+        map_w(i,j,k)=w
+      enddo
+    enddo
+  enddo
+end subroutine build_grib2_vertical_map
 
 !>@brief Interpolate pressure-level GRIB2 T and q to the actual FV3 full-level pressure.
 !! The GRIB2 values are point values on fixed isobaric surfaces, so no
@@ -3175,7 +3384,7 @@ end subroutine grib2_read_field_open
 !! surfaces below the actual FV3 surface are excluded, and extrapolation is
 !! bounded to one source-level interval at the top and usable bottom of a column.
  subroutine remap_tq_grib2(npz, ak, bk, ps, delp, t, q, &
-                           kmd, plev_pa, ta, qa, zvir, ptop)
+                           kmd, plev_pa, ta, qa, zvir, ptop, map_m, map_w)
   integer, intent(in):: npz, kmd
   real,    intent(in):: zvir, ptop
   real,    intent(in):: ak(npz+1), bk(npz+1)
@@ -3187,6 +3396,8 @@ end subroutine grib2_read_field_open
 ! on  input "ta" is virtual temperature
 ! on output "t" is virtual temperature
   real(KIND=4), intent(out), dimension(is:ie,js:je,npz):: q
+  integer, intent(in), optional :: map_m(is:ie,js:je,npz)
+  real, intent(in), optional :: map_w(is:ie,js:je,npz)
 ! local:
   real, dimension(kmd):: lplev
   real, dimension(is:ie,npz+1):: pe1
@@ -3194,6 +3405,37 @@ end subroutine grib2_read_field_open
   real :: lpfull, w
   integer i,j,k,m,kbot_src
   real, parameter :: pe_top_eps = 1.e-9
+
+  if (present(map_m) .neqv. present(map_w)) then
+     call mpp_error(FATAL,'remap_tq_grib2: map_m/map_w must be supplied together')
+  endif
+  if (present(map_m)) then
+     if ( .not. nudge_q .and. .not. climate_nudging ) q = 0.0
+     if ( nudge_q .or. climate_nudging ) then
+!$OMP parallel do private(i,k,m,w) schedule(static)
+        do j=js,je
+           do i=is,ie
+              do k=1,npz
+                 m=map_m(i,j,k); w=map_w(i,j,k)
+                 q(i,j,k)=(1.0-w)*qa(i,j,m)+w*qa(i,j,m+1)
+                 q(i,j,k)=max(0.0,q(i,j,k))
+              enddo
+           enddo
+        enddo
+!$OMP end parallel do
+     endif
+!$OMP parallel do private(i,k,m,w) schedule(static)
+     do j=js,je
+        do i=is,ie
+           do k=1,npz
+              m=map_m(i,j,k); w=map_w(i,j,k)
+              t(i,j,k)=(1.0-w)*ta(i,j,m)+w*ta(i,j,m+1)
+           enddo
+        enddo
+     enddo
+!$OMP end parallel do
+     return
+  endif
 
   if (kmd < 2) then
      call mpp_error(FATAL,'remap_tq_grib2: at least two pressure levels are required')
@@ -3317,7 +3559,7 @@ end subroutine grib2_read_field_open
 !! pressure surfaces below the FV3 surface, and uses bounded interpolation/
 !! extrapolation of the pressure-level wind profile in log(p).
  subroutine remap_uv_grib2(npz, ak, bk, ps, delp, u, v, &
-                           kmd, plev_pa, u0, v0, ptop)
+                           kmd, plev_pa, u0, v0, ptop, map_m, map_w)
   integer, intent(in):: npz, kmd
   real,    intent(in):: ptop
   real,    intent(in):: ak(npz+1), bk(npz+1)
@@ -3326,6 +3568,8 @@ end subroutine grib2_read_field_open
   real, intent(in), dimension(isd:ied,jsd:jed,npz):: delp
   real(KIND=4), intent(in), dimension(is:ie,js:je,kmd):: u0, v0
   real(KIND=4), intent(inout), dimension(is:ie,js:je,npz):: u, v
+  integer, intent(in), optional :: map_m(is:ie,js:je,npz)
+  real, intent(in), optional :: map_w(is:ie,js:je,npz)
 ! local:
   real, dimension(kmd):: lplev
   real, dimension(is:ie,npz+1):: pe1
@@ -3333,6 +3577,33 @@ end subroutine grib2_read_field_open
   real :: lpfull, w
   integer i,j,k,m,kbot_src
   real, parameter :: pe_top_eps = 1.e-9
+
+  if (present(map_m) .neqv. present(map_w)) then
+     call mpp_error(FATAL,'remap_uv_grib2: map_m/map_w must be supplied together')
+  endif
+  if (present(map_m)) then
+!$OMP parallel do private(i,k,m,w) schedule(static)
+     do j=js,je
+        do i=is,ie
+           do k=1,npz
+              m=map_m(i,j,k); w=map_w(i,j,k)
+              u(i,j,k)=(1.0-w)*u0(i,j,m)+w*u0(i,j,m+1)
+           enddo
+        enddo
+     enddo
+!$OMP end parallel do
+!$OMP parallel do private(i,k,m,w) schedule(static)
+     do j=js,je
+        do i=is,ie
+           do k=1,npz
+              m=map_m(i,j,k); w=map_w(i,j,k)
+              v(i,j,k)=(1.0-w)*v0(i,j,m)+w*v0(i,j,m+1)
+           enddo
+        enddo
+     enddo
+!$OMP end parallel do
+     return
+  endif
 
   if (kmd < 2) then
      call mpp_error(FATAL,'remap_uv_grib2: at least two pressure levels are required')
@@ -4015,6 +4286,9 @@ end subroutine grib2_read_field_open
        if (allocated(alpha_x_cube)) deallocate(alpha_x_cube)
        if (allocated(alpha_y_cube)) deallocate(alpha_y_cube)
        rf_alpha_stored=.false.
+       if (allocated(rf_norm_cache)) deallocate(rf_norm_cache)
+       rf_norm_stored(:)=.false.
+       rf_norm_nf_stored(:)=-1
        call rf_clear_cube_paths()
 
        grib2_raw_im=0
@@ -5729,6 +6003,81 @@ subroutine build_coarse_alpha_from_fine(alpha_x_fine, alpha_y_fine, &
 
 end subroutine build_coarse_alpha_from_fine
 
+! Build the PE list used by GRIB2 I/O.  Unlike the RF helper, this deliberately
+! does NOT split nudge_option=4 by tile: the source GRIB2 field is global and
+! identical for all six cube faces, so one decode can serve the complete domain.
+subroutine get_grib2_domain_pelist(domain, pelist, npelist, root)
+  use mpp_mod,         only: mpp_npes, mpp_error, FATAL, mpp_get_current_pelist
+  use mpp_domains_mod, only: domain2d, mpp_get_pelist
+  implicit none
+  type(domain2d), intent(in) :: domain
+  integer, allocatable, intent(out) :: pelist(:)
+  integer, intent(out) :: npelist, root
+
+  integer :: npes_all,n,m,pe,nvalid
+  integer, allocatable :: pelist_tmp(:)
+  logical :: already_added
+
+  npes_all=mpp_npes()
+
+  ! Global option 4 is executed by the complete current atmospheric PE set.
+  ! Use that set explicitly so all six tiles share one GRIB2 decoder/root.
+  if (nudge_option == 4) then
+    npelist=npes_all
+    allocate(pelist(npelist))
+    call mpp_get_current_pelist(pelist)
+    if (npelist <= 0) call mpp_error(FATAL,'get_grib2_domain_pelist: empty current PE list')
+    root=pelist(1)
+    return
+  endif
+
+  allocate(pelist_tmp(npes_all))
+  pelist_tmp(:)=-999999
+  call mpp_get_pelist(domain,pelist_tmp)
+
+  nvalid=0
+  do n=1,npes_all
+    pe=pelist_tmp(n)
+    if (pe >= 0 .and. pe < npes_all) then
+      already_added=.false.
+      do m=1,n-1
+        if (pelist_tmp(m) == pe) already_added=.true.
+      enddo
+      if (.not.already_added) nvalid=nvalid+1
+    endif
+  enddo
+
+  if (nvalid > 0) then
+    npelist=nvalid
+    allocate(pelist(npelist))
+    nvalid=0
+    do n=1,npes_all
+      pe=pelist_tmp(n)
+      if (pe >= 0 .and. pe < npes_all) then
+        already_added=.false.
+        do m=1,nvalid
+          if (pelist(m) == pe) already_added=.true.
+        enddo
+        if (.not.already_added) then
+          nvalid=nvalid+1
+          pelist(nvalid)=pe
+        endif
+      endif
+    enddo
+  else
+    ! Defensive fallback consistent with the previous RF-domain helper.
+    npelist=npes_all
+    allocate(pelist(npelist))
+    do n=1,npelist
+      pelist(n)=n-1
+    enddo
+  endif
+  deallocate(pelist_tmp)
+
+  if (npelist <= 0) call mpp_error(FATAL,'get_grib2_domain_pelist: empty PE list')
+  root=pelist(1)
+end subroutine get_grib2_domain_pelist
+
 subroutine get_rf_domain_pelist(domain, pelist, npelist, root)
   use mpp_mod,         only: mpp_npes, mpp_pe, mpp_error, FATAL, &
                              mpp_send, mpp_recv, mpp_sync_self
@@ -5885,29 +6234,30 @@ end subroutine get_rf_domain_pelist
 ! This avoids global collectives when different tiles use different roots.
 !=========================================================
 subroutine rf_pelist_broadcast_real(buf, nwords, root, pelist, npelist)
-  use mpp_mod, only: mpp_pe, mpp_send, mpp_recv, mpp_sync_self
+  use mpp_mod, only: mpp_pe, mpp_send, mpp_recv, mpp_sync_self, mpp_broadcast
   implicit none
 
   integer, intent(in) :: nwords, root, npelist
   integer, intent(in) :: pelist(npelist)
   real,    intent(inout) :: buf(nwords)
+  integer :: n,mype
 
-  integer :: n, mype
-
-  mype = mpp_pe()
-
-  if (mype == root) then
-    do n = 1, npelist
-      if (pelist(n) /= root) then
-        call mpp_send(buf(1), plen=nwords, to_pe=pelist(n))
-      endif
-    enddo
+  ! A pelist-local collective is faster for the normal regional/global group.
+  ! Keep the proven point-to-point path for independent option-4 tile groups,
+  ! where different ranks may enter with different pelists simultaneously.
+  if (nudge_option == 4 .and. .not.rf_cube_continuous) then
+    mype=mpp_pe()
+    if (mype == root) then
+      do n=1,npelist
+        if (pelist(n) /= root) call mpp_send(buf(1),plen=nwords,to_pe=pelist(n))
+      enddo
+    else
+      call mpp_recv(buf(1),glen=nwords,from_pe=root,block=.true.)
+    endif
+    call mpp_sync_self()
   else
-    call mpp_recv(buf(1), glen=nwords, from_pe=root, block=.true.)
+    call mpp_broadcast(buf,nwords,root,pelist)
   endif
-
-  call mpp_sync_self()
-
 end subroutine rf_pelist_broadcast_real
 
 !=========================================================
@@ -6517,9 +6867,11 @@ subroutine rf_filter_cube_root(cube, ax, ay, nx, ny, nk, ntiles, nf)
   real, intent(inout) :: cube(nx,ny,nk,ntiles)
   real, intent(in) :: ax(nx,ny,ntiles), ay(nx,ny,ntiles)
 
-  integer :: st, n, m, l, k, it, idx, t, i, j
+  integer :: st,n,m,l,k,it,idx,t,i,j
+  integer :: clk0,clk1,clk_rate
+  real :: t_filter
   real, allocatable :: path_alpha_out(:)
-  real, allocatable :: line(:), aline(:), tmp(:), aa_line(:)
+  real, allocatable :: line(:),aline(:),tmp(:),aa_line(:)
   real, allocatable :: accum(:,:,:)
 
   if (ntiles /= 6) then
@@ -6529,6 +6881,9 @@ subroutine rf_filter_cube_root(cube, ax, ay, nx, ny, nk, ntiles, nf)
     call mpp_error(FATAL,'rf_filter_cube_root: six global FV3 faces must be square')
   endif
 
+  call system_clock(count_rate=clk_rate)
+  call system_clock(clk0)
+
   ! Geometry is cached by active RF-grid dimensions.  rf_step_cube and
   ! rf_neighbor_ij are therefore used only when this coarse-grid topology
   ! is first built (or when nf_skip_grid changes the active dimensions).
@@ -6537,15 +6892,21 @@ subroutine rf_filter_cube_root(cube, ax, ay, nx, ny, nk, ntiles, nf)
   allocate(path_alpha_out(rf_path_nstate))
   call rf_build_path_alpha(ax,ay,nx,ny,ntiles,path_alpha_out)
 
+  ! Every vertical/component level is independent.  Give each OpenMP thread
+  ! private recurrence and accumulation work arrays; the arithmetic within a
+  ! level/path is unchanged from the serial implementation.
+!$OMP PARALLEL DEFAULT(SHARED) PRIVATE(st,n,m,l,k,it,idx,t,i,j,line,aline,tmp,aa_line,accum)
   allocate(line(rf_path_maxloop),aline(rf_path_maxloop))
   allocate(tmp(rf_path_maxloop),aa_line(rf_path_maxloop))
   allocate(accum(nx,ny,ntiles))
-
+!$OMP DO SCHEDULE(STATIC)
   do k=1,nk
     if (nudge_debug .and. (k == 1 .or. mod(k,10) == 0 .or. k == nk)) then
+!$OMP CRITICAL(rf_cube_debug_print)
       write(*,'(a,i4,a,i4,a,2(es13.5,1x))') 'RF continuous cube level ',k,' / ',nk, &
            ' input min/max = ',minval(cube(:,:,k,:)),maxval(cube(:,:,k,:))
       flush(6)
+!$OMP END CRITICAL(rf_cube_debug_print)
     endif
 
     do it=1,nf
@@ -6586,13 +6947,21 @@ subroutine rf_filter_cube_root(cube, ax, ay, nx, ny, nk, ntiles, nf)
     enddo
 
     if (nudge_debug .and. (k == 1 .or. mod(k,10) == 0 .or. k == nk)) then
+!$OMP CRITICAL(rf_cube_debug_print)
       write(*,'(a,i4,a,2(es13.5,1x))') 'RF continuous cube level ',k, &
            ' output min/max = ',minval(cube(:,:,k,:)),maxval(cube(:,:,k,:))
       flush(6)
+!$OMP END CRITICAL(rf_cube_debug_print)
     endif
   enddo
+!$OMP END DO
+  deallocate(line,aline,tmp,aa_line,accum)
+!$OMP END PARALLEL
 
-  deallocate(path_alpha_out,line,aline,tmp,aa_line,accum)
+  deallocate(path_alpha_out)
+  call system_clock(clk1)
+  t_filter=real(clk1-clk0)/real(clk_rate)
+  if (nudge_debug) write(*,'(a,f10.4,a,i6)') 'RF cube root filter cost = ',t_filter,' s; levels=',nk
 end subroutine rf_filter_cube_root
 
 subroutine rf_debug_dump_slice(tag, field1, kmd, lon, lat, field2)
@@ -6808,6 +7177,11 @@ subroutine build_rf_alpha_cube_from_L(gridstruct, Lx_m, Ly_m, bd, domain)
     return
   endif
 
+  ! The normalization depends on the active alpha field.  A rebuilt alpha
+  ! invalidates any cached normalization, but a cache hit above leaves it reusable.
+  rf_norm_stored(:)=.false.
+  rf_norm_nf_stored(:)=-1
+
   ! Alpha is rebuilt infrequently (only when L/grid/stride changes), so keep
   ! the robust fine-grid gather here.  The large 3-D field gather below is
   ! sampled BEFORE MPI communication, which is where skip-grid saves the
@@ -6978,8 +7352,10 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
   integer :: cis,cie,cjs,cje,ni_s,nj_s,ig,jg
   integer :: fis,fie,fjs,fje,ric1,ric2,rjc1,rjc2
   integer :: ni_r,nj_r,nrecv,maxscatter,sp,pp
-  integer :: pc1,pc2,pj1,pj2,pni,pnj,pwords
+  integer :: pc1,pc2,pj1,pj2,pni,pnj,pwords,total_scatter
+  integer :: clk_rate,clk0,clk1,clk_total0,clk_total1
   integer, allocatable :: meta(:,:),sizes(:),imap(:),jmap(:)
+  integer, allocatable :: scatter_offsets(:),scatter_sizes(:)
   integer, allocatable :: coarse_hit(:,:,:)
   integer, allocatable :: ilo_i(:),ihi_i(:),ilo_j(:),ihi_j(:)
   integer :: local_meta(9)
@@ -6987,6 +7363,11 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
   real, allocatable :: sendbuf(:),recvbuf(:),cube(:,:,:,:)
   real, allocatable :: face(:,:,:),scatterbuf(:)
   real :: wi,wj
+  real :: t_map,t_gather,t_filter,t_scatter,t_interp,t_total
+
+  call system_clock(count_rate=clk_rate)
+  call system_clock(clk_total0)
+  t_map=0.0; t_gather=0.0; t_filter=0.0; t_scatter=0.0; t_interp=0.0
 
   mype=mpp_pe()
   npes=mpp_npes()
@@ -6997,6 +7378,7 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
   ny=jeg-jsg+1
   nact_loc=min(nact,kmd)
 
+  call system_clock(clk0)
   call rf_build_symmetric_index_map(nx,strideg,nxc,imap)
   call rf_build_symmetric_index_map(ny,strideg,nyc,jmap)
 
@@ -7004,7 +7386,10 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
   allocate(ilo_j(ny),ihi_j(ny),wj_j(ny))
   call rf_build_interp_map(nx,nxc,imap,ilo_i,ihi_i,wi_i)
   call rf_build_interp_map(ny,nyc,jmap,ilo_j,ihi_j,wj_j)
+  call system_clock(clk1)
+  t_map=real(clk1-clk0)/real(clk_rate)
 
+  call system_clock(clk0)
   if (mype == root) then
     if (.not.allocated(alpha_x_cube) .or. .not.allocated(alpha_y_cube)) then
       call mpp_error(FATAL,'rf2d_apply_cube_global: centralized alpha cube is not built')
@@ -7151,7 +7536,10 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
   endif
   call mpp_sync_self()
   deallocate(sendbuf)
+  call system_clock(clk1)
+  t_gather=real(clk1-clk0)/real(clk_rate)
 
+  call system_clock(clk0)
   if (mype == root) then
     if (nudge_debug) write(*,'(a,4(i6,1x))') &
          'RF centralized cube nx ny levels target_stride = ',nxc,nyc,nact_loc,strideg
@@ -7161,7 +7549,10 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
       flush(6)
     endif
   endif
+  call system_clock(clk1)
+  t_filter=real(clk1-clk0)/real(clk_rate)
 
+  call system_clock(clk0)
   ! Each PE receives only the coarse rectangle needed to interpolate its
   ! own fine-grid compute domain.  This replaces the previous whole-face
   ! return to every PE.
@@ -7175,7 +7566,8 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
   allocate(face(ric1:ric2,rjc1:rjc2,nact_loc))
 
   if (mype == root) then
-    maxscatter=max(1,nrecv)
+    allocate(scatter_offsets(npes),scatter_sizes(npes))
+    total_scatter=0
     do p=1,npes
       pc1=ilo_i(meta(2,p))
       pc2=ihi_i(meta(3,p))
@@ -7183,21 +7575,21 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
       pj2=ihi_j(meta(5,p))
       pni=pc2-pc1+1
       pnj=pj2-pj1+1
-      maxscatter=max(maxscatter,pni*pnj*nact_loc)
+      scatter_offsets(p)=total_scatter
+      scatter_sizes(p)=pni*pnj*nact_loc
+      total_scatter=total_scatter+scatter_sizes(p)
     enddo
-    allocate(scatterbuf(maxscatter))
+    allocate(scatterbuf(max(1,total_scatter)))
 
+    ! Pack every PE's return rectangle into a distinct part of one persistent
+    ! buffer.  mpp_send can then post all sends before a single synchronization.
     do p=1,npes
       tile=meta(1,p)
       pc1=ilo_i(meta(2,p))
       pc2=ihi_i(meta(3,p))
       pj1=ilo_j(meta(4,p))
       pj2=ihi_j(meta(5,p))
-      pni=pc2-pc1+1
-      pnj=pj2-pj1+1
-      pwords=pni*pnj*nact_loc
-
-      idx=0
+      idx=scatter_offsets(p)
       do k=1,nact_loc
         do jc=pj1,pj2
           do ic=pc1,pc2
@@ -7206,42 +7598,44 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
           enddo
         enddo
       enddo
-
-      if (p == 1) then
-        idx=0
-        do k=1,nact_loc
-          do jc=rjc1,rjc2
-            do ic=ric1,ric2
-              idx=idx+1
-              face(ic,jc,k)=scatterbuf(idx)
-            enddo
-          enddo
-        enddo
-      else
-        pe=p-1
-        if (nudge_debug .and. (pe == 1 .or. mod(pe,50) == 0 .or. pe == npes-1)) then
-          write(*,'(a,i6,a,i6,a,i2,a,i8)') 'RF scatter subdomain to PE ',pe, &
-               ' / ',npes-1,' tile=',tile,' words=',pwords
-          flush(6)
-        endif
-        call mpp_send(scatterbuf(1),plen=pwords,to_pe=pe)
-        ! mpp_send may not have consumed scatterbuf on return.  Because the
-        ! next PE gets a DIFFERENT packed rectangle, complete this send before
-        ! scatterbuf is overwritten for the next PE.
-        call mpp_sync_self()
-      endif
     enddo
 
-    deallocate(scatterbuf)
+    ! Root extracts its own rectangle from the already-packed buffer.
+    idx=scatter_offsets(1)
+    do k=1,nact_loc
+      do jc=rjc1,rjc2
+        do ic=ric1,ric2
+          idx=idx+1
+          face(ic,jc,k)=scatterbuf(idx)
+        enddo
+      enddo
+    enddo
+
+    do p=2,npes
+      pe=p-1
+      pwords=scatter_sizes(p)
+      if (nudge_debug .and. (pe == 1 .or. mod(pe,50) == 0 .or. pe == npes-1)) then
+        write(*,'(a,i6,a,i6,a,i2,a,i8)') 'RF scatter subdomain to PE ',pe, &
+             ' / ',npes-1,' tile=',meta(1,p),' words=',pwords
+        flush(6)
+      endif
+      call mpp_send(scatterbuf(scatter_offsets(p)+1),plen=pwords,to_pe=pe)
+    enddo
+    call mpp_sync_self()
+
+    deallocate(scatterbuf,scatter_offsets,scatter_sizes)
     if (nudge_debug) then
       write(*,'(a)') 'RF centralized subdomain scatter COMPLETE'
       flush(6)
     endif
   else
     call mpp_recv(face(ric1,rjc1,1),glen=nrecv,from_pe=root,block=.true.)
+    call mpp_sync_self()
   endif
-  call mpp_sync_self()
+  call system_clock(clk1)
+  t_scatter=real(clk1-clk0)/real(clk_rate)
 
+  call system_clock(clk0)
   ! Interpolate the endpoint-preserving coarse map back to the local fine
   ! compute domain.  With stride=1 this reduces exactly to direct copy.
   do k=1,nact_loc
@@ -7263,8 +7657,18 @@ subroutine rf2d_apply_cube_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, 
     enddo
   enddo
 
+  call system_clock(clk1)
+  t_interp=real(clk1-clk0)/real(clk_rate)
+
   deallocate(face,imap,jmap,ilo_i,ihi_i,ilo_j,ihi_j,wi_i,wj_j)
   if (mype == root) deallocate(cube,meta,sizes,coarse_hit)
+  call system_clock(clk_total1)
+  t_total=real(clk_total1-clk_total0)/real(clk_rate)
+  if (mype == root .and. nudge_debug) then
+    write(*,'(a,6(f10.4,a))') 'RF cube apply timing: map=',t_map,' s, gather=',t_gather, &
+         ' s, filter=',t_filter,' s, scatter=',t_scatter,' s, interp=',t_interp, &
+         ' s, total=',t_total,' s'
+  endif
 end subroutine rf2d_apply_cube_global
 
 subroutine build_rf_alpha_from_L(gridstruct, Lx_m, Ly_m, bd, domain)
@@ -7433,6 +7837,11 @@ subroutine build_rf_alpha_from_L(gridstruct, Lx_m, Ly_m, bd, domain)
     deallocate(pelist)
     return
   endif
+
+  ! The normalization depends on the active alpha field.  Invalidate it only
+  ! when alpha is actually rebuilt; repeated alpha-cache hits keep it valid.
+  rf_norm_stored(:)=.false.
+  rf_norm_nf_stored(:)=-1
 
   ni = iec - isc + 1
   nj = jec - jsc + 1
@@ -7633,7 +8042,7 @@ end subroutine build_rf_alpha_from_L
 !> 2-D recursive filter for scalar fields (T, q, etc.)
 !!  Conceptual replacement for del2_scalar.
 subroutine rf2d_scalar(qdt, kmd, bd, nf, npx, npy, domain, do_norm)
-  use mpp_domains_mod, only: domain2d, mpp_update_domains, mpp_get_compute_domain,mpp_get_global_domain
+  use mpp_domains_mod, only: domain2d,mpp_get_global_domain
   use mpp_mod,         only: mpp_root_pe
   implicit none
 
@@ -7647,23 +8056,42 @@ subroutine rf2d_scalar(qdt, kmd, bd, nf, npx, npy, domain, do_norm)
 
   real :: norm2d(is:ie, js:je)
   integer :: isg, ieg, jsg, jeg
+  integer :: clk_rate,clk0,clk1,clk_total0,clk_total1
+  real :: t_norm,t_apply,t_total
+
+  call system_clock(count_rate=clk_rate)
+  call system_clock(clk_total0)
+  t_norm=0.0; t_apply=0.0
 
   ! 1) (Optional) compute norm2d (global RF applied to ones, then gather back)
+  call system_clock(clk0)
   if (do_norm) then
      call rf2d_norm_global(norm2d, bd, npx, npy, nf, domain)
   else
      norm2d = 1.0
   end if
+  call system_clock(clk1)
+  t_norm=real(clk1-clk0)/real(clk_rate)
 
   ! 2) Apply global RF to qdt itself
   call mpp_get_global_domain(domain, isg, ieg, jsg, jeg)
+  call system_clock(clk0)
   call rf2d_apply_global(qdt, bd, nf, isg, ieg, jsg, jeg, kmd, domain)
+  call system_clock(clk1)
+  t_apply=real(clk1-clk0)/real(clk_rate)
 
   ! 3) Normalize (only meaningful when do_norm=.true.)
   if (do_norm) then
      qdt(is:ie, js:je, 1:kmd) = qdt(is:ie, js:je, 1:kmd) / &
                                            spread(norm2d, dim=3, ncopies=kmd)
   end if
+
+  call system_clock(clk_total1)
+  t_total=real(clk_total1-clk_total0)/real(clk_rate)
+  if (nudge_debug .and. is_master()) then
+     write(*,'(a,3(f10.4,a))') 'RF scalar detail: norm=',t_norm,' s, apply=',t_apply, &
+          ' s, total=',t_total,' s'
+  endif
 
 end subroutine rf2d_scalar
 
@@ -7687,57 +8115,113 @@ subroutine rf_uv(du, dv, kmd, bd, nf, npx, npy, gridstruct, domain)
   real, intent(inout) :: dv(is:ie, js:je, kmd)
 
   real(kind=R_GRID), pointer :: vlon(:,:,:), vlat(:,:,:)
-  real, allocatable :: v1(:,:,:), v2(:,:,:), v3(:,:,:)
+  real, allocatable :: v123(:,:,:)
   real :: norm2d(is:ie,js:je)
-  integer :: i,j,k,isg, ieg, jsg, jeg
+  integer :: i,j,k,isg,ieg,jsg,jeg,nact_save,n
+  integer :: clk_rate,clk0,clk1,clk_total0,clk_total1
+  integer, allocatable :: klist_save(:)
+  logical :: klist_was_alloc
+  real :: t_transform,t_norm,t_apply,t_inverse,t_total
+
+  call system_clock(count_rate=clk_rate)
+  call system_clock(clk_total0)
+  t_transform=0.0; t_norm=0.0; t_apply=0.0; t_inverse=0.0
 
   vlon => gridstruct%vlon
   vlat => gridstruct%vlat
 
-  allocate(v1(bd%isd:bd%ied, bd%jsd:bd%jed, kmd))
-  allocate(v2(bd%isd:bd%ied, bd%jsd:bd%jed, kmd))
-  allocate(v3(bd%isd:bd%ied, bd%jsd:bd%jed, kmd))
-  v1 = 0.0; v2 = 0.0; v3 = 0.0
+  ! Stack the three Cartesian components in the third dimension.  They remain
+  ! mathematically independent RF levels, but one rf2d_apply_global call now
+  ! performs one gather/filter/scatter round for all three components.
+  allocate(v123(bd%isd:bd%ied,bd%jsd:bd%jed,3*kmd))
+  v123=0.0
 
-  ! --- transform (u,v) -> Cartesian components (v1,v2,v3) on compute domain
+  call system_clock(clk0)
 !$omp parallel do private(i,j,k) default(shared)
-  do k = 1, kmd
-    do j = js, je
-      do i = is, ie
-        v1(i,j,k) = du(i,j,k)*vlon(i,j,1) + dv(i,j,k)*vlat(i,j,1)
-        v2(i,j,k) = du(i,j,k)*vlon(i,j,2) + dv(i,j,k)*vlat(i,j,2)
-        v3(i,j,k) = du(i,j,k)*vlon(i,j,3) + dv(i,j,k)*vlat(i,j,3)
-      end do
-    end do
-  end do
+  do k=1,kmd
+    do j=js,je
+      do i=is,ie
+        v123(i,j,k)       = du(i,j,k)*vlon(i,j,1) + dv(i,j,k)*vlat(i,j,1)
+        v123(i,j,kmd+k)   = du(i,j,k)*vlon(i,j,2) + dv(i,j,k)*vlat(i,j,2)
+        v123(i,j,2*kmd+k) = du(i,j,k)*vlon(i,j,3) + dv(i,j,k)*vlat(i,j,3)
+      enddo
+    enddo
+  enddo
 !$omp end parallel do
+  call system_clock(clk1)
+  t_transform=real(clk1-clk0)/real(clk_rate)
 
-  call mpp_get_global_domain(domain, isg, ieg, jsg, jeg)
-  ! --- apply GLOBAL RF.  The variable-coefficient forward/adjoint pair is
-  ! symmetric but does not preserve a constant field without normalization.
-  ! Compute that normalization once and reuse it for all three Cartesian
-  ! wind components.
-  call rf2d_norm_global(norm2d, bd, npx, npy, nf, domain)
-  call rf2d_apply_global(v1(is:ie, js:je, 1:kmd), bd, nf, isg, ieg, jsg, jeg, kmd, domain)
-  call rf2d_apply_global(v2(is:ie, js:je, 1:kmd), bd, nf, isg, ieg, jsg, jeg, kmd, domain)
-  call rf2d_apply_global(v3(is:ie, js:je, 1:kmd), bd, nf, isg, ieg, jsg, jeg, kmd, domain)
-  v1(is:ie,js:je,1:kmd)=v1(is:ie,js:je,1:kmd)/spread(norm2d,dim=3,ncopies=kmd)
-  v2(is:ie,js:je,1:kmd)=v2(is:ie,js:je,1:kmd)/spread(norm2d,dim=3,ncopies=kmd)
-  v3(is:ie,js:je,1:kmd)=v3(is:ie,js:je,1:kmd)/spread(norm2d,dim=3,ncopies=kmd)
+  call mpp_get_global_domain(domain,isg,ieg,jsg,jeg)
 
-  ! --- inverse transform back to (u,v)
+  call system_clock(clk0)
+  call rf2d_norm_global(norm2d,bd,npx,npy,nf,domain)
+  call system_clock(clk1)
+  t_norm=real(clk1-clk0)/real(clk_rate)
+
+  ! rf2d_apply_global selects active levels through module nact/klist.  Expand
+  ! that list so the same active physical levels are filtered for all three
+  ! stacked Cartesian components, then restore the caller's state exactly.
+  nact_save=nact
+  klist_was_alloc=allocated(klist)
+  if (klist_was_alloc) then
+    allocate(klist_save(size(klist)))
+    klist_save=klist
+  else
+    allocate(klist_save(0))
+  endif
+
+  if (allocated(klist)) deallocate(klist)
+  nact=3*nact_save
+  allocate(klist(nact))
+  do n=1,nact_save
+    klist(n)=klist_save(n)
+    klist(nact_save+n)=kmd+klist_save(n)
+    klist(2*nact_save+n)=2*kmd+klist_save(n)
+  enddo
+
+  call system_clock(clk0)
+  if (nact > 0) then
+    call rf2d_apply_global(v123(is:ie,js:je,1:3*kmd),bd,nf,isg,ieg,jsg,jeg,3*kmd,domain)
+  endif
+  call system_clock(clk1)
+  t_apply=real(clk1-clk0)/real(clk_rate)
+
+  nact=nact_save
+  if (allocated(klist)) deallocate(klist)
+  if (klist_was_alloc) then
+    allocate(klist(size(klist_save)))
+    klist=klist_save
+  endif
+  deallocate(klist_save)
+
+  v123(is:ie,js:je,1:3*kmd)=v123(is:ie,js:je,1:3*kmd)/ &
+       spread(norm2d,dim=3,ncopies=3*kmd)
+
+  call system_clock(clk0)
 !$omp parallel do private(i,j,k) default(shared)
-  do k = 1, kmd
-    do j = js, je
-      do i = is, ie
-        du(i,j,k) = v1(i,j,k)*vlon(i,j,1) + v2(i,j,k)*vlon(i,j,2) + v3(i,j,k)*vlon(i,j,3)
-        dv(i,j,k) = v1(i,j,k)*vlat(i,j,1) + v2(i,j,k)*vlat(i,j,2) + v3(i,j,k)*vlat(i,j,3)
-      end do
-    end do
-  end do
+  do k=1,kmd
+    do j=js,je
+      do i=is,ie
+        du(i,j,k) = v123(i,j,k)*vlon(i,j,1) + &
+                    v123(i,j,kmd+k)*vlon(i,j,2) + &
+                    v123(i,j,2*kmd+k)*vlon(i,j,3)
+        dv(i,j,k) = v123(i,j,k)*vlat(i,j,1) + &
+                    v123(i,j,kmd+k)*vlat(i,j,2) + &
+                    v123(i,j,2*kmd+k)*vlat(i,j,3)
+      enddo
+    enddo
+  enddo
 !$omp end parallel do
+  call system_clock(clk1)
+  t_inverse=real(clk1-clk0)/real(clk_rate)
 
-  deallocate(v1, v2, v3)
+  deallocate(v123)
+  call system_clock(clk_total1)
+  t_total=real(clk_total1-clk_total0)/real(clk_rate)
+  if (nudge_debug .and. is_master()) then
+    write(*,'(a,5(f10.4,a))') 'RF UV detail: transform=',t_transform,' s, norm=',t_norm, &
+         ' s, apply3=',t_apply,' s, inverse=',t_inverse,' s, total=',t_total,' s'
+  endif
 end subroutine rf_uv
 
 !=========================================================
@@ -7746,7 +8230,7 @@ end subroutine rf_uv
 subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domain)
   use mpp_mod,         only: mpp_pe, mpp_root_pe, mpp_send, mpp_recv, mpp_sync_self, &
                               mpp_npes, mpp_broadcast, mpp_error, FATAL
-  use mpp_domains_mod, only: domain2d, mpp_get_pelist, mpp_update_domains
+  use mpp_domains_mod, only: domain2d, mpp_get_pelist
   use fv_arrays_mod,   only: fv_grid_bounds_type
   implicit none
 
@@ -7756,14 +8240,15 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
   real,                      intent(inout) :: field_inout(is:ie, js:je, 1:kmd)
 
   integer :: mype, root, npelist, nact_loc
+  integer :: clk_rate,clk0,clk1,clk_total0,clk_total1
   integer :: ni, nj, ni_skipg, nj_skipg, local_send_count
   integer :: i, j, k, n, idx
   integer :: skipg, strideg
   integer :: i_global, j_global, ii, jj, ii_next, jj_next
   integer :: i_coarse_global, j_coarse_global
   real    :: wi, wj
+  real    :: t_gather,t_filter,t_bcast,t_recon,t_total
   logical :: is_root
-  real    :: field(bd%isd:bd%ied, bd%jsd:bd%jed, 1:kmd)
 
   integer, allocatable :: pelist(:)
   integer, allocatable :: pe_is(:), pe_ie(:), pe_js(:), pe_je(:)
@@ -7789,6 +8274,10 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
     return
   endif
 
+  call system_clock(count_rate=clk_rate)
+  call system_clock(clk_total0)
+  t_gather=0.0; t_filter=0.0; t_bcast=0.0; t_recon=0.0
+
   mype = mpp_pe()
   call get_rf_domain_pelist(domain, pelist, npelist, root)
   is_root = (mype == root)
@@ -7798,17 +8287,8 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
 
   nact_loc = min(nact, kmd)
 
-  !$OMP parallel do default(none) shared(is,ie,js,je,kmd,field,field_inout)
-  do k = 1, kmd
-    do j = js, je
-      do i = is, ie
-        field(i,j,k) = field_inout(i,j,k)
-      enddo
-    enddo
-  enddo
-  !$OMP end parallel do
-
-  call mpp_update_domains(field, domain, complete=.true.)
+  ! The gather below reads compute-domain points only; no halo values are used.
+  ! Avoid the former halo-sized copy and mpp_update_domains exchange.
 
   ni = ie - is + 1
   nj = je - js + 1
@@ -7818,6 +8298,7 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
   ! =================================================================
   if (skipg == 0) then
 
+    call system_clock(clk0)
     if (is_root) then
       allocate(global_field(isg:ieg, jsg:jeg, 1:nact_loc))
       global_field = 0.0
@@ -7858,7 +8339,7 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
     do k = 1, nact_loc
       do j = js, je
         do i = is, ie
-          send_buf(idx) = field(i, j, klist(k))
+          send_buf(idx) = field_inout(i, j, klist(k))
           idx = idx + 1
         enddo
       enddo
@@ -7892,7 +8373,10 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
     call mpp_sync_self()
 
     deallocate(send_buf)
+    call system_clock(clk1)
+    t_gather=real(clk1-clk0)/real(clk_rate)
 
+    call system_clock(clk0)
     if (is_root) then
       !$OMP PARALLEL DO PRIVATE(k) SCHEDULE(STATIC)
       do k = 1, nact_loc
@@ -7901,13 +8385,19 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
       enddo
       !$OMP END PARALLEL DO
     endif
+    call system_clock(clk1)
+    t_filter=real(clk1-clk0)/real(clk_rate)
 
     if (.not. is_root) then
       allocate(global_field(isg:ieg, jsg:jeg, 1:nact_loc))
     endif
 
+    call system_clock(clk0)
     call rf_pelist_broadcast_real(global_field(isg,jsg,1), size(global_field), root, pelist, npelist)
+    call system_clock(clk1)
+    t_bcast=real(clk1-clk0)/real(clk_rate)
 
+    call system_clock(clk0)
     !$OMP PARALLEL DO PRIVATE(i,j,k) SHARED(is,ie,js,je,nact_loc,field_inout,global_field,klist) &
     !$OMP SCHEDULE(STATIC)
     do k = 1, nact_loc
@@ -7918,16 +8408,25 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
       enddo
     enddo
     !$OMP END PARALLEL DO
+    call system_clock(clk1)
+    t_recon=real(clk1-clk0)/real(clk_rate)
 
     deallocate(global_field)
     if (is_root) deallocate(pe_is, pe_ie, pe_js, pe_je, pe_sizes)
     deallocate(pelist)
+    call system_clock(clk_total1)
+    t_total=real(clk_total1-clk_total0)/real(clk_rate)
+    if (is_root .and. nudge_debug) then
+      write(*,'(a,5(f10.4,a))') 'RF apply detail: gather=',t_gather,' s, filter=',t_filter, &
+           ' s, bcast=',t_bcast,' s, recon=',t_recon,' s, total=',t_total,' s'
+    endif
     return
   endif
 
   ! =================================================================
   ! CASE 2: WITH STRIDE
   ! =================================================================
+  call system_clock(clk0)
   ni_skipg = 0
   do i = is, ie
     if (mod(i - isg, strideg) == 0) ni_skipg = ni_skipg + 1
@@ -8055,7 +8554,7 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
         if (mod(j - jsg, strideg) == 0) then
           do i = is, ie
             if (mod(i - isg, strideg) == 0) then
-              send_buf(idx) = field(i, j, klist(k))
+              send_buf(idx) = field_inout(i, j, klist(k))
               idx = idx + 1
             endif
           enddo
@@ -8096,7 +8595,10 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
   call mpp_sync_self()
 
   deallocate(send_buf)
+  call system_clock(clk1)
+  t_gather=real(clk1-clk0)/real(clk_rate)
 
+  call system_clock(clk0)
   if (is_root) then
     !$OMP PARALLEL DO PRIVATE(k) SCHEDULE(STATIC)
     do k = 1, nact_loc
@@ -8107,13 +8609,19 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
     enddo
     !$OMP END PARALLEL DO
   endif
+  call system_clock(clk1)
+  t_filter=real(clk1-clk0)/real(clk_rate)
 
   if (.not. is_root) then
     allocate(global_field_coarse(1:nxg_coarse, 1:nyg_coarse, 1:nact_loc))
   endif
 
+  call system_clock(clk0)
   call rf_pelist_broadcast_real(global_field_coarse(1,1,1), size(global_field_coarse), root, pelist, npelist)
+  call system_clock(clk1)
+  t_bcast=real(clk1-clk0)/real(clk_rate)
 
+  call system_clock(clk0)
   i_last_skipg = isg + (nxg_coarse - 1) * strideg
   j_last_skipg = jsg + (nyg_coarse - 1) * strideg
 
@@ -8165,10 +8673,18 @@ subroutine rf2d_apply_global(field_inout, bd, nf, isg, ieg, jsg, jeg, kmd, domai
     enddo
   enddo
   !$OMP END PARALLEL DO
+  call system_clock(clk1)
+  t_recon=real(clk1-clk0)/real(clk_rate)
 
   deallocate(global_field_coarse)
   if (is_root) deallocate(pe_is, pe_ie, pe_js, pe_je, pe_sizes)
   deallocate(pelist)
+  call system_clock(clk_total1)
+  t_total=real(clk_total1-clk_total0)/real(clk_rate)
+  if (is_root .and. nudge_debug) then
+    write(*,'(a,5(f10.4,a))') 'RF apply detail: gather=',t_gather,' s, filter=',t_filter, &
+         ' s, bcast=',t_bcast,' s, recon=',t_recon,' s, total=',t_total,' s'
+  endif
 
 end subroutine rf2d_apply_global
 
@@ -8281,7 +8797,29 @@ subroutine rf2d_norm_global(norm2d, bd, npx, npy, nf, domain)
   integer :: nact_save
   integer, allocatable :: klist_save(:)
   logical :: klist_was_alloc
-  integer :: kmd,isg,ieg,jsg,jeg
+  integer :: kmd,isg,ieg,jsg,jeg,slot,store_slot
+
+  ! For a fixed active alpha field and number of passes, this normalization
+  ! is exactly time-independent.  Two small local slots cover the usual
+  ! nf_uv/nf_t case when the pass counts differ.  build_rf_alpha_* invalidates
+  ! both slots whenever alpha/grid/L/stride changes.
+  if (allocated(rf_norm_cache)) then
+     if (lbound(rf_norm_cache,1) /= is .or. ubound(rf_norm_cache,1) /= ie .or. &
+         lbound(rf_norm_cache,2) /= js .or. ubound(rf_norm_cache,2) /= je .or. &
+         size(rf_norm_cache,3) /= 2) then
+        deallocate(rf_norm_cache)
+        rf_norm_stored(:)=.false.
+        rf_norm_nf_stored(:)=-1
+     endif
+  endif
+  if (allocated(rf_norm_cache)) then
+     do slot=1,2
+        if (rf_norm_stored(slot) .and. rf_norm_nf_stored(slot) == nf) then
+           norm2d(:,:) = rf_norm_cache(:,:,slot)
+           return
+        endif
+     enddo
+  endif
 
   kmd = 1
   allocate(ones(is:ie, js:je, 1:kmd))
@@ -8320,6 +8858,30 @@ subroutine rf2d_norm_global(norm2d, bd, npx, npy, nf, domain)
 
   ! safer than array-temp MAX if you saw "stack smashing" before:
   where (norm2d(:,:) < 1.0e-12) norm2d(:,:) = 1.0e-12
+
+  if (.not.allocated(rf_norm_cache)) then
+     allocate(rf_norm_cache(is:ie,js:je,2))
+     rf_norm_stored(:)=.false.
+     rf_norm_nf_stored(:)=-1
+  endif
+
+  store_slot=0
+  do slot=1,2
+     if (rf_norm_stored(slot) .and. rf_norm_nf_stored(slot) == nf) store_slot=slot
+  enddo
+  if (store_slot == 0) then
+     do slot=1,2
+        if (.not.rf_norm_stored(slot)) then
+           store_slot=slot
+           exit
+        endif
+     enddo
+  endif
+  if (store_slot == 0) store_slot=1
+
+  rf_norm_cache(:,:,store_slot) = norm2d(:,:)
+  rf_norm_nf_stored(store_slot) = nf
+  rf_norm_stored(store_slot) = .true.
 
   deallocate(ones)
 end subroutine rf2d_norm_global
